@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>剧本工坊</title>
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <link rel="stylesheet" href="assets/css/main.css">
+</head>
+<body>
+<script>
+(function () {
+  var KEY_HEX = "__KEY_HEX__";
+  var PAYLOAD = "__PAYLOAD__";
+  var SS_KEY = 'sr_unlock';
+
+  var body = document.body;
+  body.innerHTML = '<div class="pv-gate"><div class="pv-gate-box"><div class="pv-gate-brand">天星AI</div><h1>剧本工坊</h1><p class="pv-gate-tip">北美本土剧 · 女频剧本撰写系统 · 请输入访问密码</p><form id="pv-form"><input id="pv-pw" type="password" placeholder="访问密码" autocomplete="current-password" autofocus><button type="submit">解锁</button></form><p id="pv-err" class="pv-gate-err" role="alert"></p></div></div>';
+  var css = document.createElement('style');
+  css.textContent = '.pv-gate{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0e16;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}.pv-gate-box{width:min(360px,88vw);padding:44px 36px;background:#131926;border:1px solid #263049;border-radius:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.5)}.pv-gate-brand{font-size:13px;letter-spacing:6px;color:#8b94ad;margin-bottom:14px}.pv-gate-box h1{font-size:20px;color:#f2f4fa;margin:0 0 6px;font-weight:600}.pv-gate-tip{font-size:13px;color:#6b7490;margin:0 0 26px}#pv-form{display:flex;gap:10px}#pv-pw{flex:1;padding:11px 14px;border-radius:8px;border:1px solid #2c3852;background:#0b0e16;color:#f2f4fa;font-size:15px;outline:none}#pv-pw:focus{border-color:#ff5c8a}#pv-form button{padding:11px 20px;border-radius:8px;border:0;background:linear-gradient(135deg,#ff5c8a,#c44dff);color:#fff;font-size:15px;font-weight:600;cursor:pointer}#pv-form button:hover{filter:brightness(1.1)}.pv-gate-err{color:#ff7676;font-size:13px;min-height:18px;margin:14px 0 0}.pv-gate.pv-shake{animation:pvshake .35s}@keyframes pvshake{20%{transform:translateX(-7px)}40%{transform:translateX(7px)}60%{transform:translateX(-5px)}80%{transform:translateX(5px)}}';
+  document.head.appendChild(css);
+
+  var form = document.getElementById('pv-form');
+  var input = document.getElementById('pv-pw');
+  var err = document.getElementById('pv-err');
+  if (!(window.crypto && crypto.subtle)) {
+    err.textContent = '当前环境不支持加密解密（需 HTTPS 或 localhost 访问）';
+    input.disabled = true;
+    return;
+  }
+  form.addEventListener('submit', function (e) { e.preventDefault(); sha256Hex(input.value).then(tryKey); });
+
+  function sha256Hex(str) {
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function (buf) {
+      return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+    });
+  }
+
+  async function tryKey(hex) {
+    if (hex !== KEY_HEX) { fail('密码不正确'); return; }
+    try {
+      sessionStorage.setItem(SS_KEY, hex);
+      await unlock(hex);
+    } catch (e) { fail('解密失败：' + e.message); sessionStorage.removeItem(SS_KEY); }
+  }
+
+  function fail(msg) {
+    err.textContent = msg;
+    input.value = ''; input.focus();
+    var g = document.querySelector('.pv-gate');
+    g.classList.remove('pv-shake'); void g.offsetWidth; g.classList.add('pv-shake');
+  }
+
+  async function unlock(hex) {
+    var raw = atob(PAYLOAD);
+    var bytes = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    var iv = bytes.slice(0, 12), data = bytes.slice(12);
+    var key = await crypto.subtle.importKey('raw', hexToBytes(KEY_HEX), 'AES-GCM', false, ['decrypt']);
+    var plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, data);
+    var html = new TextDecoder().decode(plain);
+
+    document.body.innerHTML = html;
+    var t = document.getElementById('pv-title-orig');
+    if (t) { document.title = t.textContent; t.remove(); }
+
+    document.querySelectorAll('script').forEach(function (old) {
+      var s = document.createElement('script');
+      Array.from(old.attributes).forEach(function (a) { s.setAttribute(a.name, a.value); });
+      s.text = old.textContent;
+      old.replaceWith(s);
+    });
+
+    decryptImages();
+  }
+
+  function hexToBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  async function decryptImages() {
+    var imgs = Array.from(document.querySelectorAll('img[src^="assets/scripts/"]'));
+    imgs.forEach(function (img) {
+      var encUrl = img.getAttribute('src') + '.enc';
+      img.removeAttribute('src');
+      img.style.background = '#131926';
+      fetch(encUrl).then(function (r) { return r.arrayBuffer(); }).then(async function (buf) {
+        var bytes = new Uint8Array(buf);
+        var key = await crypto.subtle.importKey('raw', hexToBytes(KEY_HEX), 'AES-GCM', false, ['decrypt']);
+        var plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, key, bytes.slice(12));
+        img.src = URL.createObjectURL(new Blob([plain], { type: 'image/jpeg' }));
+      }).catch(function () { img.alt = '图片解密失败'; });
+    });
+  }
+
+  (async function () {
+    var saved = sessionStorage.getItem(SS_KEY);
+    if (saved === KEY_HEX) {
+      try { await unlock(saved); } catch (e) { sessionStorage.removeItem(SS_KEY); input.focus(); }
+    } else { input.focus(); }
+  })();
+})();
+</script>
+</body>
+</html>

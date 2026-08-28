@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+*.log
+/tmp/
+
+# 明文剧本源（内容资产，不入公开仓库；内部归档见 scriptroom-internal 私有仓库）
+source/
+
+# 门禁密码（通过环境变量 SCRIPTROOM_PASSWORD 或本文件注入，禁止提交）
+tools/.password
+
+# EdgeOne CLI 本地配置（含项目关联信息）
+.edgeone/
