@@ -27,6 +27,7 @@ const STAGE_ORDER = ['outline', 'synopsis', 'script', 'assets', 'publish', 'done
 
 const STAGE_STATUS_LABELS = {
   empty: '未开始',
+  requested: '已请求生成',
   draft: '生成中',
   pending_review: '待确认',
   approved: '已通过',
@@ -59,6 +60,29 @@ function adminOk(request, env) {
   const h = request.headers.get('Authorization') || '';
   if (h !== 'Bearer ' + token) return { ok: false, resp: json({ ok: false, error: 'UNAUTHORIZED', message: '鉴权失败' }, 401) };
   return { ok: true };
+}
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+
+// 管理员（Bearer ADMIN_TOKEN）或提交者（X-Edit-Key / ?key=，比对记录内 editKeyHash）
+// hasCreds：请求是否携带了任何凭据（用于 GET 区分「匿名公开查询」与「凭据错误的 401」）
+async function editorOk(request, env, rec, url) {
+  const adm = adminOk(request, env);
+  if (adm.ok) return { ok: true, role: 'admin' };
+
+  const keyHeader = request.headers.get('X-Edit-Key');
+  const keyQuery = url ? url.searchParams.get('key') : null;
+  const key = String(keyHeader || keyQuery || '').trim();
+  const hasCreds = !!(request.headers.get('Authorization') || keyHeader !== null || keyQuery !== null);
+  const fail = function (message) {
+    return { ok: false, hasCreds: hasCreds, resp: json({ ok: false, error: 'UNAUTHORIZED', message: message }, 401) };
+  };
+  if (!key || !rec.editKeyHash) return fail('鉴权失败');
+  if (await sha256Hex(key) !== rec.editKeyHash) return fail('编辑密钥不正确');
+  return { ok: true, role: 'editor' };
 }
 
 function clean(v, max) {
@@ -169,14 +193,15 @@ async function onRequestGet(context) {
   const imgKey = url.searchParams.get('img');
 
   if (imgKey) {
-    const auth = adminOk(request, env);
-    if (!auth.ok) return auth.resp;
     if (!IMG_KEY_RE.test(imgKey)) return json({ ok: false, error: 'BAD_IMG_KEY', message: '图片 key 不合法' }, 400);
+    const rec = await loadRecord(store, id);
+    if (!rec) return json({ ok: false, error: 'NOT_FOUND', message: '未找到该提交编号对应的记录' }, 404);
+    const auth = await editorOk(request, env, rec, url);
+    if (!auth.ok) return auth.resp;
     const data = await store.get(PREFIX + id + '_img_' + imgKey, { type: 'arrayBuffer' });
     if (!data) return json({ ok: false, error: 'NOT_FOUND', message: '未找到该图片' }, 404);
-    const rec = await loadRecord(store, id);
     let mime = 'image/jpeg';
-    const items = rec && rec.stages && rec.stages.assets && rec.stages.assets.content && rec.stages.assets.content.items;
+    const items = rec.stages && rec.stages.assets && rec.stages.assets.content && rec.stages.assets.content.items;
     if (Array.isArray(items)) {
       const it = items.find(function (x) { return x && x.key === imgKey; });
       if (it && it.mime) mime = it.mime;
@@ -187,12 +212,13 @@ async function onRequestGet(context) {
   const rec = await loadRecord(store, id);
   if (!rec) return json({ ok: false, error: 'NOT_FOUND', message: '未找到该提交编号对应的记录' }, 404);
 
-  const auth = adminOk(request, env);
+  const auth = await editorOk(request, env, rec, url);
   if (auth.ok) {
-    const resp = Object.assign({ ok: true, submission: rec }, stageSummary(rec));
+    const resp = Object.assign({ ok: true, submission: rec, role: auth.role }, stageSummary(rec));
     resp.stageStatuses = stageStatuses(rec);
     return json(resp);
   }
+  if (auth.hasCreds) return auth.resp;
 
   const pub = Object.assign({
     ok: true,
@@ -217,9 +243,6 @@ async function onRequestPatch(context) {
   const store = kv();
   if (!store) return json({ ok: false, error: 'KV_UNBOUND', message: 'KV 存储未绑定：请在项目设置 → KV 存储中绑定命名空间（变量名 SUBMISSIONS_KV），并重新部署' }, 503);
 
-  const auth = adminOk(request, env);
-  if (!auth.ok) return auth.resp;
-
   const id = String(params.id || '');
   if (!ID_RE.test(id)) return json({ ok: false, error: 'BAD_ID', message: '提交编号格式不正确' }, 400);
 
@@ -229,11 +252,15 @@ async function onRequestPatch(context) {
   const rec = await loadRecord(store, id);
   if (!rec) return json({ ok: false, error: 'NOT_FOUND', message: '未找到该提交编号对应的记录' }, 404);
 
+  const auth = await editorOk(request, env, rec, new URL(request.url));
+  if (!auth.ok) return auth.resp;
+
   const action = clean(body.action, 32);
   let out;
   try {
     if (!action) out = await actLegacyStatus(store, rec, body);
     else if (action === 'stage-content') out = await actStageContent(store, rec, body);
+    else if (action === 'request-generate') out = await actRequestGenerate(store, rec, body);
     else if (action === 'decision') out = await actDecision(store, rec, body);
     else if (action === 'edit-ep') out = await actEditEp(store, rec, body);
     else if (action === 'assets-choice') out = await actAssetsChoice(store, rec, body);
@@ -305,6 +332,23 @@ async function actStageContent(store, rec, body) {
   touch(rec);
   await saveRecord(store, rec);
   return { data: { stage: stage, stageStatus: entry.status, progress: entry.progress || null }, notify: { type: 'ready', stage: stage, stageLabel: STAGE_LABELS[stage] } };
+}
+
+/* ---- action：请求 AI 撰写（提交者/管理员在工作台调用） ---- */
+async function actRequestGenerate(store, rec, body) {
+  const stage = clean(body.stage, 16);
+  if (['outline', 'synopsis', 'script'].indexOf(stage) < 0)
+    return errOut(400, 'BAD_STAGE', '阶段不合法（可选 outline / synopsis / script）');
+  if (stageOf(rec) !== stage) return errOut(400, 'STAGE_NOT_ACTIVE', '仅可对当前阶段「' + STAGE_LABELS[stageOf(rec)] + '」请求生成');
+  rec.stages = rec.stages || {};
+  const entry = (rec.stages[stage] = rec.stages[stage] || { status: 'empty', updatedAt: '', feedback: '', content: {} });
+  if (entry.status !== 'empty' && entry.status !== 'requested')
+    return errOut(400, 'REQUEST_NOT_ALLOWED', '该阶段当前状态为「' + (STAGE_STATUS_LABELS[entry.status] || entry.status) + '」，无需请求生成');
+  entry.status = 'requested';
+  entry.updatedAt = new Date().toISOString();
+  touch(rec);
+  await saveRecord(store, rec);
+  return { data: { stage: stage, stageStatus: 'requested' }, notify: { type: 'request', stage: stage, stageLabel: STAGE_LABELS[stage] } };
 }
 
 /* ---- action：阶段确认（用户在工作台调用） ---- */
@@ -474,7 +518,11 @@ async function notifyStage(env, n) {
   let title = '';
   const lines = ['剧名：**《' + n.title + '》**', '编号：`' + n.id + '`'];
 
-  if (n.type === 'ready') {
+  if (n.type === 'request') {
+    title = '📥 请求生成「' + n.stageLabel + '」';
+    lines.push('提交者已在编辑工作台请求 AI 撰写该阶段内容');
+    lines.push('请安排生成并写入：' + link);
+  } else if (n.type === 'ready') {
     title = '📝 「' + n.stageLabel + '」已生成，可编辑确认';
     lines.push('请前往编辑工作台编辑并确认：' + link);
   } else if (n.type === 'decision' && n.decision === 'approved') {

@@ -397,6 +397,18 @@ code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 .np-done h3 { font-family: var(--font-display); font-size: 22px; margin: 0 0 8px; }
 .np-done p { color: var(--text-2); font-size: 14.5px; }
 .np-done-steps { text-align: left; max-width: 520px; margin: 18px auto 26px; display: grid; gap: 10px; font-size: 14px; color: var(--text-2); }
+.np-key-box { max-width: 520px; margin: 18px auto; padding: 16px 18px; border: 1px dashed rgba(176,124,255,.45); border-radius: 12px; background: rgba(176,124,255,.07); text-align: left; }
+.np-key-box .np-key-label { font-size: 12.5px; font-weight: 600; color: var(--accent-2); margin-bottom: 10px; letter-spacing: .4px; }
+.np-key-box p { margin: 10px 0 0; font-size: 12.5px !important; color: var(--muted); line-height: 1.7; }
+.np-key-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.np-key-row code { flex: 1; min-width: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; letter-spacing: 1.5px; padding: 10px 14px; border-radius: 9px; background: rgba(0,0,0,.32); border: 1px solid rgba(255,255,255,.14); color: #fff; user-select: all; }
+.np-key-row button { cursor: pointer; border: 1px solid rgba(176,124,255,.5); background: rgba(176,124,255,.14); color: #d9c2ff; border-radius: 9px; padding: 10px 16px; font-size: 13px; font-weight: 600; }
+.np-key-row button:hover { background: rgba(176,124,255,.24); }
+.np-enter-btn { display: block; max-width: 520px; margin: 4px auto 0; padding: 15px 20px; border-radius: 12px; text-decoration: none; font-size: 16px; font-weight: 700; color: #160a10; background: linear-gradient(135deg, var(--accent), #ffa8c5); }
+.np-enter-btn:hover { filter: brightness(1.06); }
+.np-countdown { margin: 14px 0 0 !important; font-size: 13px !important; }
+.np-countdown b { color: var(--accent); }
+.np-countdown a { color: var(--accent-2); }
 .new-plan-side { display: grid; gap: 18px; }
 .np-side-card { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--radius); padding: 22px 24px; }
 .np-side-card h3 { font-family: var(--font-display); font-size: 17px; margin: 0 0 14px; }

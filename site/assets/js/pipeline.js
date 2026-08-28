@@ -8,7 +8,7 @@
   var STAGE_LABELS = { outline: '大纲', synopsis: '分集梗概', script: '完整剧本', assets: '视觉资产', publish: '发布上线', done: '已完成' };
   var STAGE_FLOW = ['outline', 'synopsis', 'script', 'assets', 'publish', 'done'];
   var STAGE_STATUS_LABELS = {
-    empty: '未开始', draft: '生成中', pending_review: '待编辑确认', approved: '已确认', rejected: '已驳回（旧）',
+    empty: '未开始', requested: '已请求生成', draft: '生成中', pending_review: '待编辑确认', approved: '已确认', rejected: '已驳回（旧）',
     awaiting_choice: '待选择', generating: '生成中', skipped: '已跳过', pending: '待发布', done: '已完成',
   };
   var PAIRINGS = { bg: 'BG 男女', bl: 'BL 男男', gl: 'GL 女女' };
@@ -17,14 +17,16 @@
     rebirth: '重生复仇', 'hidden-identity': '隐藏身份', contract: '契约婚姻',
   };
 
-  var state = { token: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false };
+  var state = { token: '', role: 'admin', editKey: '', editId: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false };
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   function api(method, path, body, raw) {
-    var opt = { method: method, headers: { 'Authorization': 'Bearer ' + state.token } };
+    var opt = { method: method, headers: {} };
+    if (state.role === 'editor' && state.editKey) opt.headers['X-Edit-Key'] = state.editKey;
+    else opt.headers['Authorization'] = 'Bearer ' + state.token;
     if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
     return fetch(path, opt).then(function (r) {
       if (raw) return r;
@@ -45,13 +47,43 @@
   function entryOf(rec, stage) { return (rec && rec.stages && rec.stages[stage]) || null; }
   function statusOf(rec, stage) { var e = entryOf(rec, stage); return e && e.status ? e.status : 'empty'; }
 
-  /* ---------- token 门 ---------- */
+  /* ---------- 门禁：管理员令牌 / 提交者编号+密钥 ---------- */
 
-  function initToken() {
-    var saved = localStorage.getItem(TOKEN_KEY);
-    if (saved) { state.token = saved; verifyToken(true); }
+  function showGate() {
+    $('#pl-app').hidden = true;
+    $('#pl-token').hidden = false;
+  }
+
+  function initGate() {
+    $$('.pl-gate-tab').forEach(function (b) {
+      b.addEventListener('click', function () {
+        $$('.pl-gate-tab').forEach(function (x) { x.classList.remove('active'); });
+        b.classList.add('active');
+        var g = b.getAttribute('data-gate');
+        $('#pl-gate-admin').hidden = g !== 'admin';
+        $('#pl-gate-editor').hidden = g !== 'editor';
+      });
+    });
+
     $('#pl-token-btn').addEventListener('click', function () { verifyToken(false); });
     $('#pl-token-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') verifyToken(false); });
+    $('#pl-editor-btn').addEventListener('click', function () { editorLogin(false); });
+    $('#pl-editor-key').addEventListener('keydown', function (e) { if (e.key === 'Enter') editorLogin(false); });
+
+    var qs = new URLSearchParams(location.search);
+    var urlId = qs.get('id'), urlKey = qs.get('key');
+
+    if (urlId && urlKey) {
+      editorLogin(true, urlId, urlKey);
+      return;
+    }
+    var saved = localStorage.getItem(TOKEN_KEY);
+    if (saved) { state.token = saved; verifyToken(true); return; }
+    if (urlId) {
+      var k = localStorage.getItem('sr_edit_key_' + urlId);
+      if (k) { editorLogin(true, urlId, k); return; }
+    }
+    showGate();
   }
 
   function verifyToken(silent) {
@@ -59,25 +91,70 @@
     var v = (input.value || '').trim();
     if (v) state.token = v;
     if (!state.token) { if (!silent) showTokenErr('请输入 ADMIN_TOKEN'); return; }
+    state.role = 'admin';
     api('GET', '/api/submissions').then(function () {
       localStorage.setItem(TOKEN_KEY, state.token);
       enterApp();
     }).catch(function (ex) {
       localStorage.removeItem(TOKEN_KEY);
-      $('#pl-app').hidden = true;
-      $('#pl-token').hidden = false;
+      state.token = '';
+      showGate();
       showTokenErr(ex.message === '鉴权失败' ? '令牌不正确，请重新输入' : ('验证失败：' + ex.message));
     });
   }
 
+  function editorLogin(silent, presetId, presetKey) {
+    var id = (presetId || ($('#pl-editor-id') || {}).value || '').trim();
+    var key = (presetKey || ($('#pl-editor-key') || {}).value || '').trim();
+    if (!id || !key) { if (!silent) showEditorErr('请输入提交编号与编辑密钥'); return; }
+    state.role = 'editor';
+    state.editKey = key;
+    state.editId = id;
+    fetch('/api/submissions/' + encodeURIComponent(id), { headers: { 'X-Edit-Key': key } })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok && j.ok !== false, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.j.message || ('HTTP ' + res.ok));
+        localStorage.setItem('sr_edit_key_' + id, key);
+        enterApp();
+      })
+      .catch(function (ex) {
+        state.editKey = '';
+        state.editId = '';
+        state.role = 'admin';
+        showGate();
+        if (!silent) {
+          showEditorErr(ex.message === '鉴权失败' || ex.message === '编辑密钥不正确' ? '编号或编辑密钥不正确，请重新输入' : ('验证失败：' + ex.message));
+        } else {
+          var qs = new URLSearchParams(location.search);
+          if (qs.get('id') && qs.get('key')) {
+            history.replaceState(null, '', location.pathname + '?id=' + encodeURIComponent(qs.get('id')));
+          }
+        }
+      });
+  }
+
   function showTokenErr(msg) { var e = $('#pl-token-err'); e.textContent = msg; e.hidden = false; }
+  function showEditorErr(msg) { var e = $('#pl-editor-err'); e.textContent = msg; e.hidden = false; }
 
   function enterApp() {
     $('#pl-token-err').hidden = true;
+    $('#pl-editor-err').hidden = true;
     $('#pl-token').hidden = true;
     $('#pl-app').hidden = false;
     var id = new URLSearchParams(location.search).get('id');
-    if (id) openDetail(id); else loadList();
+    if (id) openDetail(id);
+    else if (state.role === 'editor' && state.editId) openDetail(state.editId);
+    else if (state.role === 'admin') loadList();
+    else showGate();
+  }
+
+  function exitToGate() {
+    state.role = 'admin';
+    state.editKey = '';
+    state.editId = '';
+    state.rec = null;
+    history.replaceState(null, '', location.pathname);
+    showGate();
   }
 
   /* ---------- 列表视图 ---------- */
@@ -142,6 +219,8 @@
 
   function renderDetail() {
     var rec = state.rec;
+    var back = $('#pl-back');
+    if (back) back.textContent = state.role === 'editor' ? '← 退出编辑（返回入口）' : '← 返回提交列表';
     $('#pl-head').innerHTML =
       '<div class="pl-head-row"><h2>《' + esc(rec.title) + '》</h2>' +
       '<button id="pl-reload" class="pl-btn pl-btn-ghost" type="button">刷新状态</button></div>' +
@@ -212,9 +291,15 @@
   }
 
   /* ---- 阶段 1：大纲（可编辑表单） ---- */
+  function reqBar(stage, label, hint) {
+    return '<div class="pl-req-row">' +
+      '<button type="button" class="pl-btn pl-btn-req" data-req="' + esc(stage) + '">✦ 请求 AI 撰写' + esc(label) + '</button>' +
+      '<span class="pl-muted" style="margin:0">' + esc(hint) + '</span></div>';
+  }
+
   function panelOutline(rec, entry, status) {
-    if (status === 'empty' || status === 'draft' || status === 'generating')
-      return waitHtml('大纲生成中…', 'AI 正在撰写剧本大纲（世界观 / 人物 / 五幕主线 / 付费卡点策略），完成后可在此直接编辑。');
+    if (status === 'requested' || status === 'draft' || status === 'generating')
+      return waitHtml('大纲撰写中…', '已请求 AI 撰写剧本大纲（世界观 / 人物 / 五幕主线 / 付费卡点策略），生成后可在此直接编辑。');
     var c = (entry && entry.content) || {};
     var charRows = (c.mainChars || []).map(function (m) { return charRowTpl(m); }).join('');
     var actCards = (c.fiveActs || []).map(function (a) { return actCardTpl(a); }).join('');
@@ -222,9 +307,13 @@
       return '<div class="pl-field"><label>' + esc(label) + '</label>' +
         '<textarea id="' + id + '" class="pl-ta" rows="' + (rows || 3) + '">' + esc(val || '') + '</textarea></div>';
     }
+    var isEmpty = status === 'empty';
     return '<h3 class="pl-stage-title">阶段 1/5 · 剧本大纲' + stBadge(status) + '</h3>' +
       (status === 'rejected' ? legacyRejectedNote() : '') +
-      '<p class="pl-muted" style="margin:0 0 16px">AI 已生成大纲初稿，所有字段均可直接修改。</p>' +
+      (isEmpty ? reqBar('outline', '大纲', '点击后由 AI 生成初稿；生成期间也可直接在下方手动填写。') : '') +
+      '<p class="pl-muted" style="margin:0 0 16px">' + (isEmpty
+        ? '大纲尚未生成：可请求 AI 撰写，或直接在下方手动填写（保存后即可确认推进）。'
+        : 'AI 已生成大纲初稿，所有字段均可直接修改。') + '</p>' +
       fld('Logline（英文）', 'ol-logline', c.logline, 3) +
       fld('Logline（中文）', 'ol-loglineZh', c.loglineZh, 3) +
       '<div class="pl-field"><label>题材标签（逗号分隔）</label>' +
@@ -240,7 +329,7 @@
       '<div class="pl-field"><label>五幕主线</label>' +
       '<div id="pl-acts">' + (actCards || '<p class="pl-muted">暂无幕，点击下方添加。</p>') + '</div>' +
       '<button type="button" class="pl-mini ol-add-act">+ 添加幕</button></div>' +
-      confirmBar(true, '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
+      confirmBar(true, isEmpty ? '手动填写后「保存修改」即进入待确认状态；AI 生成的初稿也会出现在此表单中，可继续修改。' : '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
   }
 
   function charRowTpl(m) {
@@ -298,31 +387,41 @@
   }
 
   /* ---- 阶段 2：分集梗概（可编辑表格） ---- */
+  function synopsisRow(e) {
+    e = e || {};
+    return '<tr class="sy-row" data-ep="' + esc(e.ep || '') + '">' +
+      '<td class="pl-mono">EP' + String(e.ep || '').padStart(2, '0') + '</td>' +
+      '<td><input class="pl-in sy-title" value="' + esc(e.title || '') + '" placeholder="标题"></td>' +
+      '<td><input class="pl-in sy-hook" value="' + esc(e.hook || '') + '" placeholder="结尾钩子"></td>' +
+      '<td><input class="pl-in sy-beat" value="' + esc(e.beat || '') + '" placeholder="剧情节拍"></td>' +
+      '<td><input class="pl-in sy-paymark" value="' + esc(e.paymark || '') + '" placeholder="付费卡点标记"></td>' +
+      '</tr>';
+  }
+
   function panelSynopsis(rec, entry, status) {
-    if (status === 'empty' || status === 'draft')
-      return waitHtml('分集梗概生成中…', '大纲已确认，AI 正在撰写全 ' + (rec.episodes || '?') + ' 集分集梗概与钩子，完成后可在此直接编辑。');
+    if (status === 'requested' || status === 'draft')
+      return waitHtml('分集梗概撰写中…', '已请求 AI 撰写全 ' + (rec.episodes || '?') + ' 集分集梗概与钩子，生成后可在此直接编辑。');
     var eps = (entry.content && entry.content.episodes) || [];
-    if (!eps.length) return waitHtml('分集梗概生成中…', '尚未写入内容。');
+    var isEmpty = status === 'empty';
+    if (!eps.length && !isEmpty) return waitHtml('分集梗概生成中…', '尚未写入内容。');
     var ol = entryOf(rec, 'outline');
     var acts = (ol && ol.content && ol.content.fiveActs) || [];
-    var rows = eps.map(function (e) {
-      return '<tr class="sy-row" data-ep="' + esc(e.ep) + '">' +
-        '<td class="pl-mono">EP' + String(e.ep).padStart(2, '0') + '</td>' +
-        '<td><input class="pl-in sy-title" value="' + esc(e.title || '') + '" placeholder="标题"></td>' +
-        '<td><input class="pl-in sy-hook" value="' + esc(e.hook || '') + '" placeholder="结尾钩子"></td>' +
-        '<td><input class="pl-in sy-beat" value="' + esc(e.beat || '') + '" placeholder="剧情节拍"></td>' +
-        '<td><input class="pl-in sy-paymark" value="' + esc(e.paymark || '') + '" placeholder="付费卡点标记"></td>' +
-        '</tr>';
-    }).join('');
+    var rows = eps.map(synopsisRow).join('');
     var groupNote = acts.length
       ? '<p class="pl-muted">幕划分：' + acts.map(function (a) { return esc(a.title) + '（' + esc(a.epRange || '') + '）'; }).join(' / ') + '</p>'
       : '';
     return '<h3 class="pl-stage-title">阶段 2/5 · 分集梗概' + stBadge(status) + '</h3>' +
       (status === 'rejected' ? legacyRejectedNote() : '') +
-      '<p class="pl-muted">共 ' + eps.length + ' / ' + (rec.episodes || '?') + ' 集' + (eps.length < Number(rec.episodes) ? '（尚未写完）' : '') + '，每集的标题 / 钩子 / 节拍 / 付费标记均可直接修改。</p>' +
+      (isEmpty ? reqBar('synopsis', '分集梗概', '点击后由 AI 生成全集梗概；也可点击表格下方「+ 添加一集」手动撰写。') : '') +
+      '<p class="pl-muted">' + (isEmpty
+        ? '分集梗概尚未生成：可请求 AI 撰写，或手动逐集添加（保存后即可确认推进）。'
+        : '共 ' + eps.length + ' / ' + (rec.episodes || '?') + ' 集' + (eps.length < Number(rec.episodes) ? '（尚未写完）' : '') + '，每集的标题 / 钩子 / 节拍 / 付费标记均可直接修改。') + '</p>' +
       groupNote +
-      '<div class="pl-block"><div class="pl-table-wrap pl-ep-scroll"><table class="pl-table"><thead><tr><th>集</th><th style="width:18%">标题</th><th style="width:26%">钩子</th><th style="width:28%">剧情节拍</th><th style="width:14%">付费标记</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
-      confirmBar(true, '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
+      '<div class="pl-block"><div class="pl-table-wrap pl-ep-scroll"><table class="pl-table"><thead><tr><th>集</th><th style="width:18%">标题</th><th style="width:26%">钩子</th><th style="width:28%">剧情节拍</th><th style="width:14%">付费标记</th></tr></thead>' +
+      '<tbody' + (isEmpty ? ' id="pl-sy-tbody"' : '') + '>' + rows + '</tbody></table></div>' +
+      (isEmpty ? '<button type="button" class="pl-mini sy-add-ep" style="margin-top:8px">+ 添加一集</button>' : '') +
+      '</div>' +
+      confirmBar(true, isEmpty ? '手动添加并填写集数后「保存修改」即进入待确认状态；AI 生成的梗概也会填入此表，可继续修改。' : '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
   }
 
   function collectSynopsis() {
@@ -340,10 +439,13 @@
 
   /* ---- 阶段 3：完整剧本（模块化编辑器） ---- */
   function panelScript(rec, entry, status) {
-    if (status === 'empty' || status === 'draft') {
+    if (status === 'empty')
+      return '<h3 class="pl-stage-title">阶段 3/5 · 完整剧本' + stBadge(status) + '</h3>' +
+        reqBar('script', '完整剧本', '点击后由 AI 按已确认的分集梗概分批撰写全集剧本；生成期间可随时「刷新状态」查看进度。');
+    if (status === 'requested' || status === 'draft') {
       var p = entry && entry.progress;
       return waitHtml('完整剧本生成中…',
-        (p ? '已生成 ' + p.written + ' / ' + p.total + ' 集。' : '分集梗概已确认，AI 正在分批撰写全集完整剧本。') +
+        (p ? '已生成 ' + p.written + ' / ' + p.total + ' 集。' : '已请求 AI 分批撰写全集完整剧本。') +
         '生成完成后可逐集在线编辑。');
     }
     var eps = (entry.content && entry.content.episodes) || [];
@@ -573,18 +675,25 @@
 
   /* ---------- 保存与确认 ---------- */
 
+  function requestGenerate(stage) {
+    api('PATCH', '/api/submissions/' + state.rec.id, { action: 'request-generate', stage: stage })
+      .then(function () { loadDetail(state.rec.id); })
+      .catch(function (ex) { alert('请求失败：' + ex.message); });
+  }
+
   function saveStageEdits(stage, done, btn) {
     var content = stage === 'outline' ? collectOutline() : collectSynopsis();
     var st = statusOf(state.rec, stage);
+    var toReview = st === 'rejected' || st === 'empty';
     if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
     api('PATCH', '/api/submissions/' + state.rec.id, {
-      action: 'stage-content', stage: stage, ready: st === 'rejected', content: content,
+      action: 'stage-content', stage: stage, ready: toReview, content: content,
     }).then(function () {
       state.dirty = false;
       var entry = entryOf(state.rec, stage);
       if (entry) {
         entry.content = content;
-        if (st === 'rejected') entry.status = 'pending_review';
+        if (toReview) entry.status = 'pending_review';
       }
       renderStagePanel();
       if (done) done();
@@ -600,6 +709,10 @@
       alert('当前剧集有未保存的修改，请先点击「保存本集」。');
       return;
     }
+    if ((stage === 'outline' || stage === 'synopsis') && st === 'empty' && !state.dirty) {
+      alert('该阶段内容为空：请先点击「请求 AI 撰写」生成初稿，或在表单中手动填写后再确认。');
+      return;
+    }
     if (!confirm('确认「' + STAGE_LABELS[stage] + '」内容无误？确认后将自动进入下一阶段。')) return;
     var id = state.rec.id;
     var proceed = function () {
@@ -611,7 +724,7 @@
         })
         .catch(function (ex) { alert('确认失败：' + ex.message); });
     };
-    if ((stage === 'outline' || stage === 'synopsis') && (state.dirty || st === 'rejected')) {
+    if ((stage === 'outline' || stage === 'synopsis') && (state.dirty || st === 'rejected' || st === 'empty')) {
       saveStageEdits(stage, proceed);
     } else if (st === 'rejected') {
       api('PATCH', '/api/submissions/' + id, { action: 'stage-content', stage: stage, ready: true })
@@ -646,9 +759,10 @@
   /* ---------- init ---------- */
 
   function init() {
-    initToken();
+    initGate();
     $('#pl-refresh').addEventListener('click', loadList);
     $('#pl-back').addEventListener('click', function () {
+      if (state.role === 'editor') { exitToGate(); return; }
       history.replaceState(null, '', location.pathname);
       loadList();
     });
@@ -675,6 +789,20 @@
       } else if (t.classList.contains('ol-del-act')) {
         var d = t.closest('.ol-act');
         if (d) { d.remove(); state.dirty = true; }
+      } else if (t.classList.contains('sy-add-ep')) {
+        var sy = $('#pl-sy-tbody');
+        if (sy) {
+          var next = $$('.sy-row', sy).length + 1;
+          sy.insertAdjacentHTML('beforeend', synopsisRow({ ep: next }));
+          state.dirty = true;
+        }
+      } else if (t.classList.contains('pl-btn-req')) {
+        var reqStage = t.getAttribute('data-req');
+        if (reqStage && !t.disabled) {
+          t.disabled = true;
+          t.textContent = '已请求，等待生成…';
+          requestGenerate(reqStage);
+        }
       } else if (t.id === 'pl-save') {
         if (stage === 'outline' || stage === 'synopsis') saveStageEdits(stage, null, t);
       } else if (t.id === 'pl-confirm') {

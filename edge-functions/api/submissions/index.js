@@ -26,6 +26,7 @@ const STAGE_LABELS = {
 const STAGE_ORDER = ['outline', 'synopsis', 'script', 'assets', 'publish', 'done'];
 const STAGE_STATUS_LABELS = {
   empty: '未开始',
+  requested: '已请求生成',
   draft: '生成中',
   pending_review: '待确认',
   approved: '已通过',
@@ -64,6 +65,19 @@ function genId() {
   return 'SR_' + ymd + '_' + s;
 }
 
+function genEditKey() {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let s = '';
+  for (const b of bytes) s += alphabet[b % 62];
+  return s;
+}
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+
 function adminOk(request, env) {
   const token = (env && env.ADMIN_TOKEN) || '';
   if (!token) return { ok: false, resp: json({ ok: false, error: 'ADMIN_TOKEN_UNSET', message: '未配置 ADMIN_TOKEN 环境变量，请在控制台项目设置中添加' }, 503) };
@@ -91,6 +105,7 @@ async function onRequestPost(context) {
   if (!CATEGORIES[category]) return json({ ok: false, error: 'BAD_CATEGORY', message: '题材母题不合法' }, 400);
   if (EPISODES.indexOf(episodes) < 0) return json({ ok: false, error: 'BAD_EPISODES', message: '集数体量不合法（60 / 72 / 80）' }, 400);
 
+  const editKey = genEditKey();
   const rec = {
     id: genId(),
     createdAt: new Date().toISOString(),
@@ -104,13 +119,14 @@ async function onRequestPost(context) {
     episodes: episodes,
     benchmark: clean(body.benchmark, 200),
     contact: clean(body.contact, 200),
+    editKeyHash: await sha256Hex(editKey),
   };
   await store.put(PREFIX + rec.id, JSON.stringify(rec));
 
   const webhook = (env && env.FEISHU_WEBHOOK) || '';
   if (webhook && waitUntil) waitUntil(notifyFeishu(webhook, (env && env.FEISHU_WEBHOOK_SECRET) || '', rec));
 
-  return json({ ok: true, id: rec.id, status: rec.status, statusLabel: '已接收' });
+  return json({ ok: true, id: rec.id, editKey: editKey, status: rec.status, statusLabel: '已接收' });
 }
 
 async function onRequestGet(context) {

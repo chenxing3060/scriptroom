@@ -51,20 +51,23 @@ scriptroom/
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | `/api/submissions` | 公开 | 提交创意。字段：`title`*、`idea`*、`pairing`(bg/bl/gl)*、`category`(六母题)*、`episodes`(60/72/80)*、`benchmark`、`contact`。返回 `{ ok, id, status, statusLabel }` |
-| GET | `/api/submissions` | Bearer ADMIN_TOKEN | 管理端查看全部提交（按时间倒序，含各阶段状态摘要，不含阶段正文） |
-| GET | `/api/submissions/:id` | 公开（编号不可枚举） | 查询单条进度（含 `stage` / `stageLabel` / `stageStatusLabel`）。管理员带 token 返回完整记录（含全部阶段内容） |
-| GET | `/api/submissions/:id?img=<key>` | Bearer ADMIN_TOKEN | 拉取审阅图片，以 `image/jpeg` 二进制返回 |
-| PATCH | `/api/submissions/:id` | Bearer ADMIN_TOKEN | 管线 action 分发（见下表）；无 `action` 字段时兼容旧版 `{status, note}` 流转 |
+| POST | `/api/submissions` | 公开 | 提交创意。字段：`title`*、`idea`*、`pairing`(bg/bl/gl)*、`category`(六母题)*、`episodes`(60/72/80)*、`benchmark`、`contact`。返回 `{ ok, id, editKey, status, statusLabel }`——`editKey` 为 16 位提交者编辑密钥，**仅此一次返回**（服务端只存 SHA-256 哈希） |
+| GET | `/api/submissions` | Bearer ADMIN_TOKEN | 管理端查看全部提交（按时间倒序，含各阶段状态摘要，不含阶段正文）。编辑密钥不可访问列表 |
+| GET | `/api/submissions/:id` | 公开（编号不可枚举） | 查询单条进度（含 `stage` / `stageLabel` / `stageStatusLabel`）。管理员带 token 或提交者带 `X-Edit-Key` / `?key=` 返回完整记录（`role` 区分身份）；凭据错误返回 401，无凭据返回公开摘要 |
+| GET | `/api/submissions/:id?img=<key>` | 管理员或提交者 | 拉取审阅图片，以 `image/jpeg` 二进制返回 |
+| PATCH | `/api/submissions/:id` | 管理员或提交者 | 管线 action 分发（见下表）；无 `action` 字段时兼容旧版 `{status, note}` 流转 |
 
 提交编号形如 `SR_20260828_Ab3xK9mQ`（日期 + 8 位随机字符），用户可在表单提交后直接查询进度。
+
+**权限矩阵**：管理员（Bearer ADMIN_TOKEN）可操作全部记录的全部 action；提交者（X-Edit-Key）仅能操作自己这一条记录，且拥有与管理员相同的编辑确认权限（stage-content / request-generate / decision / edit-ep / assets-choice），但不可访问列表接口。旧记录（无 `editKeyHash`）密钥鉴权一律 401，仅管理员可管理。
 
 ### PATCH action 一览
 
 | action | 请求体 | 行为 |
 |---|---|---|
-| `stage-content` | `{action, stage, content, ready?}` | 写入阶段内容（outline / synopsis / script / assets）。`ready`（默认 true）置「待确认」并推进 `stage`、飞书通知；`ready:false` 供剧本**分批写入**（按 ep 合并、更新 progress）。agent 调用 |
-| `decision` | `{action, stage, decision:"approved"\|"rejected", note}` | 管理员「确认推进」：`approved` 锁定该阶段并自动进入下一阶段（工作台确认按钮触发；如有未保存编辑会先自动保存）。`rejected` 仅保留作 API 兼容，新界面不再使用 |
+| `stage-content` | `{action, stage, content, ready?}` | 写入阶段内容（outline / synopsis / script / assets）。`ready`（默认 true）置「待确认」并推进 `stage`、飞书通知；`ready:false` 供剧本**分批写入**（按 ep 合并、更新 progress）。agent 或用户调用 |
+| `request-generate` | `{action, stage}` | **请求 AI 撰写**：把当前阶段从 `empty`（或幂等的 `requested`）置为 `requested`，飞书通知管理员安排生成。仅对当前阶段、且状态为 empty/requested 时可用。用户调用 |
+| `decision` | `{action, stage, decision:"approved"\|"rejected", note}` | 「确认推进」：`approved` 锁定该阶段并自动进入下一阶段（工作台确认按钮触发；如有未保存编辑会先自动保存）。`rejected` 仅保留作 API 兼容，新界面不再使用 |
 | `edit-ep` | `{action, ep, data:{title,hook,scenes}}` | **模块化单集编辑**：按集号 upsert（场景/对白行可增删）。仅剧本阶段「待确认/已驳回」时可用。用户调用 |
 | `assets-choice` | `{action, choice:"generate"\|"skip"}` | 选择生成视觉资产或**跳过生图**（跳过仍可上线，详情页无图、封面用主题色渐变）。用户调用 |
 | `asset-put` | `{action, key, label, aspect, mime, dataBase64}` | 上传单张审阅图片（解码后 ≤400KB），存独立 KV key `sub_<id>_img_<key>`，主记录只存元数据。agent 调用 |
@@ -84,21 +87,22 @@ scriptroom/
 ### 本地测试
 
 ```bash
-node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，69 项断言
+node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，89 项断言（含 v1.5 编辑密钥链与请求生成）
 ```
 
-## 多阶段编辑确认管线（v1.4）
+## 多阶段编辑确认管线（v1.5 · 提交即入编辑）
 
-提交不再直接进入终态，而是走**五阶段编辑确认流**：每个阶段由 AI（Kimi K3 文案 / 速创 生图，由 agent 编排）生成内容写入 KV，管理员在**加密编辑工作台** `pipeline.html` 中直接编辑修改，确认后**自动进入下一阶段**：
+提交成功即进入编辑管线：提交者在成功页拿到**提交编号 + 16 位编辑密钥**（并自动跳转，密钥存本机 localStorage），可直接进入加密编辑工作台 `pipeline.html` 逐阶段「请求 AI 撰写 → 在线编辑 → 确认推进」，直至剧本完成上线。管理员凭 `ADMIN_TOKEN` 管理全部提交，权限与提交者等同（另可看列表）。
 
 ```
 提交创意 ─▶ ① 大纲 ─▶ ② 分集梗概 ─▶ ③ 完整剧本(全集·逐集编辑) ─▶ ④ 视觉资产 ─▶ ⑤ 发布上线 ─▶ done
-           AI生成→编辑→确认   AI生成→编辑→确认    AI生成→逐集编辑→确认     生成或跳过→确认    飞书文档+线上
+           请求生成→编辑→确认  请求生成→编辑→确认  请求生成→逐集编辑→确认    生成或跳过→确认   飞书文档+线上
 ```
 
 ### 阶段状态机
 
-- 通用：`empty → pending_review(待编辑确认) → approved(已确认)`
+- 通用：`empty → requested(已请求生成) → pending_review(待编辑确认) → approved(已确认)`
+- `empty` 状态也可**跳过请求直接手动填写**：表单保存（ready:true）即进入 `pending_review`
 - 剧本阶段支持 `draft`（agent 分批写入中，60-80 集按 6-12 集/批规避 1MB 请求体限制）
 - 资产阶段特有：`awaiting_choice → generating → pending_review → approved` 或 `→ skipped`
 - 已确认的阶段**内容锁定**；`rejected` 仅作旧记录 / API 兼容保留，编辑界面不再产生驳回
@@ -108,6 +112,7 @@ node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，69 项断�
 ```jsonc
 {
   "id": "SR_20260828_Ab3xK9mQ", "status": "generating",
+  "editKeyHash": "sha256(16位编辑密钥)",        // 明文密钥仅在 POST 响应出现一次
   "stage": "outline",                       // outline|synopsis|script|assets|publish|done
   "stages": {
     "outline":  { "status": "pending_review", "feedback": "", "content": { "logline": "…", "fiveActs": [ … ] } },
@@ -120,7 +125,7 @@ node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，69 项断�
 }
 ```
 
-旧记录（无 `stage`/`stages`）自动按 `outline · 未开始` 兼容处理。
+旧记录（无 `stage`/`stages`）自动按 `outline · 未开始` 兼容处理；旧记录无 `editKeyHash`，编辑密钥鉴权一律 401。
 
 ### Agent 编排示例（curl）
 
@@ -146,14 +151,17 @@ curl -X PATCH $API/$ID -H "Authorization: Bearer $T" -H 'Content-Type: applicati
 
 ### 编辑工作台（pipeline.html）
 
-站内入口在「撰写新剧本」页脚；直达链接 `pipeline.html?id=<编号>`（飞书通知卡片带此深链）。首次进入输入 `ADMIN_TOKEN`（存本机 localStorage），之后：
+门禁为**双模式**：「管理员」输入 `ADMIN_TOKEN`（存本机 localStorage）；「我是提交者」输入**提交编号 + 编辑密钥**（成功页深链 `pipeline.html?id=<编号>&key=<密钥>` 自动登录，密钥存 `localStorage['sr_edit_key_<id>']`，URL 中的密钥登录后即剥离）。两种身份在详情页权限等同；提交者无列表视图，退出编辑即返回入口。
 
-1. **列表视图**：全部提交 + 当前阶段徽章，点击进入编辑；
-2. **大纲**：全部字段可编辑（logline 双语 / 题材标签 / 世界观 / CP 动力学 / 人物表增删 / 五幕卡增删）→「保存修改」暂存或「确认无误，进入下一阶段」（自动保存后推进）；
-3. **分集梗概**：全集表格逐格编辑（标题 / 钩子 / 节拍 / 付费标记）→ 保存 / 确认推进；
-4. **完整剧本**：左侧集数网格（已编辑徽章）、右侧**单集模块化编辑器**（标题 / 钩子 / 场景 / 对白行[角色·英文·中文]，可增删），「保存本集」即时落库，全部满意后确认推进；
-5. **视觉资产**：选择「生成」或「跳过」；生成后画廊逐张查看（图片按需 fetch 渲染）→ 确认推进；
-6. **发布**：显示飞书文档与线上页面链接，全链路闭环。
+管理员列表视图：全部提交 + 当前阶段徽章，点击进入编辑。各阶段面板：
+
+1. **大纲**：`empty` 状态显示「✦ 请求 AI 撰写大纲」按钮（点击置为已请求生成，等待 agent 写入；也可直接在空表单手动填写）；内容就绪后全部字段可编辑（logline 双语 / 题材标签 / 世界观 / CP 动力学 / 人物表增删 / 五幕卡增删）→「保存修改」暂存或「确认无误，进入下一阶段」（自动保存后推进）；
+2. **分集梗概**：同样支持请求生成 / 手动「+ 添加一集」；内容就绪后全集表格逐格编辑（标题 / 钩子 / 节拍 / 付费标记）→ 保存 / 确认推进；
+3. **完整剧本**：`empty` 状态可请求生成；分批写入期间显示进度；就绪后左侧集数网格（已编辑徽章）、右侧**单集模块化编辑器**（标题 / 钩子 / 场景 / 对白行[角色·英文·中文]，可增删），「保存本集」即时落库，全部满意后确认推进；
+4. **视觉资产**：选择「生成」或「跳过」；生成后画廊逐张查看（图片按需 fetch 渲染）→ 确认推进；
+5. **发布**：显示飞书文档与线上页面链接，全链路闭环。
+
+「撰写新剧本」页提交成功后：成功页展示编号与编辑密钥（仅显示一次，带复制按钮）、「进入编辑工作台」大按钮，以及 8 秒倒计时自动跳转（可点「暂不跳转」取消）。
 
 确认动作会自动保存未保存的编辑（大纲 / 梗概），并在飞书推送「阶段已确认」通知。
 
@@ -162,6 +170,7 @@ curl -X PATCH $API/$ID -H "Authorization: Bearer $T" -H 'Content-Type: applicati
 | 事件 | 触发时机 |
 |---|---|
 | 新提交 | POST /api/submissions |
+| 请求生成 | request-generate（提交者请求 AI 撰写某阶段） |
 | 已生成可编辑确认 | stage-content `ready:true` |
 | 阶段已确认 | decision approved |
 | 资产生成选择 | assets-choice |
@@ -272,11 +281,12 @@ jobs:
 | localStorage | `planvis-lang` / `pv_unlock` | `scriptroom-lang` / `sr_unlock` |
 | 交付物 | 立项决策依据 | 可开机拍摄的剧本包 |
 
-## 当前状态（v1.4 · 2026-08-28）
+## 当前状态（v1.5 · 2026-08-28）
 
 - 5 个加密页面：首页 / 剧本库（母题 × 配向双重筛选）/ 撰写入口 / 管线编辑工作台 / 《血月新娘》72 集完整剧本
 - 配对取向维度：BG / BL / GL 表单必选 + 筛选直达（`scripts.html?cat=…&pair=…`）
-- **在线提交后端**：边缘函数 API（提交 / 进度查询 / 管线 action 分发 / 图片端点）+ KV 持久化 + 飞书通知，69 项本地测试通过
-- **五阶段编辑确认管线**：AI 生成 → 管理员在线编辑（大纲全字段 / 梗概逐格 / 剧本逐集模块化）→ 确认后自动进入下一阶段 → 视觉资产（可跳过生图）→ 发布上线（飞书文档 + 线上剧本库）
+- **在线提交后端**：边缘函数 API（提交 / 进度查询 / 管线 action 分发 / 图片端点）+ KV 持久化 + 飞书通知，89 项本地测试通过
+- **五阶段编辑确认管线**：AI 生成 → 在线编辑（大纲全字段 / 梗概逐格 / 剧本逐集模块化）→ 确认后自动进入下一阶段 → 视觉资产（可跳过生图）→ 发布上线（飞书文档 + 线上剧本库）
+- **提交即入编辑管线（v1.5）**：提交成功返回 16 位编辑密钥（服务端仅存哈希），成功页展示密钥 + 深链按钮 + 8 秒倒计时自动跳转；工作台门禁双模式（管理员令牌 / 提交者编号+密钥），各内容阶段提供「请求 AI 撰写」默认按钮（empty → requested），空状态亦可直接手动填写保存推进
 - 5 张加密视觉资产（9:16 Key Art / 16:9 角色四视图 / 4:3 场景剧情概念图）
 - 页面与图片解密往返均字节级验收通过
