@@ -71,7 +71,7 @@ scriptroom/
 | `edit-ep` | `{action, ep, data:{title,hook,scenes}}` | **模块化单集编辑**：按集号 upsert（场景/对白行可增删）。仅剧本阶段「待确认/已驳回」时可用。用户调用 |
 | `assets-choice` | `{action, choice:"generate"\|"skip"}` | 选择生成视觉资产或**跳过生图**（跳过仍可上线，详情页无图、封面用主题色渐变）。用户调用 |
 | `asset-put` | `{action, key, label, aspect, mime, dataBase64}` | 上传单张审阅图片（解码后 ≤400KB），存独立 KV key `sub_<id>_img_<key>`，主记录只存元数据。agent 调用 |
-| `drive` | `{action}` | **AI 生成驱动一拍**（v1.7，前端等待态自动循环调用）：按当前阶段生成一个批次并落库——大纲 3 批（设定→人物→五幕）、分集梗概每批 12 集、完整剧本每批 1 集、视觉资产先生成 5 条 prompt 再逐张生图。响应含最新记录与批次进度；90 秒分布式锁（`genLock`）防并发，密钥未配置时返回 `*_KEY_UNSET` 错误并释放锁（降级不崩溃） |
+| `drive` | `{action}` | **AI 生成驱动一拍**（v1.7，前端等待态自动循环调用）：按当前阶段生成一个批次并落库——大纲 3 批（设定→人物→五幕）、分集梗概每批 12 集、完整剧本每批 1 集、视觉资产先生成 5 条 prompt 再逐张生图（速创为**官方异步任务协议**：POST 提交任务 → detail 轮询 status 0/1→2 → 下载成品图入 KV，任务超 10 分钟僵死自动重提）。响应含最新记录与批次进度；90 秒分布式锁（`genLock`）防并发，55 秒 fetch 超时保护防平台掐断（超时前端自动重试），密钥未配置时返回 `*_KEY_UNSET` 错误并释放锁（降级不崩溃），余额不足返回含充值指引的友好错误 |
 | `publish-done` | `{action, feishuDocUrl, pageUrl}` | 发布完成：`stage=done`、`status=published`、飞书上线通知。agent 调用 |
 
 ### 控制台一次性配置（部署后）
@@ -81,19 +81,24 @@ scriptroom/
    - `ADMIN_TOKEN`（必填，管理端鉴权）：建议 `openssl rand -hex 16` 生成；
    - `KIMI_API_KEY`（必填，v1.7 真实生成）：Moonshot 开放平台 API Key（`sk-...`），未配置时 drive 返回 `KIMI_KEY_UNSET`；
    - `SUCHUANG_API_KEY`（必填，v1.7 生图）：速创生图 API Key，未配置时资产阶段返回 `SUCHUANG_KEY_UNSET`（可先跳过生图）；
-   - `KIMI_MODEL`（可选）：默认 `moonshot-v1-32k`，可换 `kimi-k3` 等模型；
+   - `KIMI_MODEL`（可选）：默认 `kimi-k3`（推理模型，思考 token 计入 max_tokens，调用侧已留足余量）；
    - `KIMI_BASE_URL`（可选）：默认 `https://api.moonshot.cn/v1`；
-   - `SUCHUANG_IMAGE_API`（可选）：默认速创生图端点 `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image`；
+   - `SUCHUANG_API_BASE`（可选）：默认速创 API 基址 `https://api.wuyinkeji.com/api/async`（官方异步协议：POST 提交任务 → GET detail 轮询 → 下载成品图）；
+   - `SUCHUANG_IMAGE_EP`（可选）：默认 `image_gpt`（GPT-Image-2，0.1 元/张；可换 `image_nanoBanana2` 等）；
    - `FEISHU_WEBHOOK`（可选）：飞书群自定义机器人的 Webhook 地址，新提交实时推送卡片；
    - `FEISHU_WEBHOOK_SECRET`（可选）：机器人开启签名校验时的密钥，函数自动计算签名；
 3. 修改配置后**重新部署一次**使环境变量生效。
 
 未完成上述配置时：提交接口返回 503 并提示原因（KV 未绑定 / 未配置 ADMIN_TOKEN），不影响静态站点访问。
 
+> 速创账户需在控制台充值或开通生图产品后才能出图（GPT-Image-2 为 0.1 元/张，5 张仅 0.5 元）；余额不足时资产阶段返回含充值指引的友好错误，**充值后无需改码自动恢复**。
+
 ### 本地测试
 
 ```bash
-node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，135 项断言（含 v1.5 编辑密钥链、v1.6 事件流与 v1.7 真实生成管线 mock）
+node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，140 项断言（含 v1.5 编辑密钥链、v1.6 事件流与 v1.7 真实生成管线 mock）
+# 真实密钥全链路 E2E（可选，消耗真实 token 与生图额度）：
+KIMI_API_KEY=sk-xxx SUCHUANG_API_KEY=xxx NODE_TLS_REJECT_UNAUTHORIZED=0 node tools/e2e-real.mjs
 ```
 
 ## 多阶段编辑确认管线（v1.5 · 提交即入编辑）
@@ -291,8 +296,8 @@ jobs:
 
 - 5 个加密页面：首页 / 剧本库（母题 × 配向双重筛选）/ 撰写入口 / 管线编辑工作台 / 《血月新娘》72 集完整剧本
 - 配对取向维度：BG / BL / GL 表单必选 + 筛选直达（`scripts.html?cat=…&pair=…`）
-- **在线提交后端**：边缘函数 API（提交 / 进度查询 / 管线 action 分发 / 图片端点 / AI 生成驱动）+ KV 持久化 + 飞书通知，135 项本地测试通过
-- **真实 AI 生成管线（v1.7）**：`drive` action 在边缘函数内直连 **Moonshot（Kimi）文本生成**与**速创生图**——大纲 3 批（设定→人物→五幕）、分集梗概每批 12 集、完整剧本每批 1 集（2 场景×4-5 行对白）、视觉资产 1 批 prompt + 逐张生图（JPEG 校验 / 2KB-400KB 限制 / base64 入 KV）。前端等待态自动循环驱动（每 2 秒一拍），实时显示批次子进度（第 N/3 批、N/72 集、N/5 张）；90 秒分布式锁防并发，密钥未配置返回 `*_KEY_UNSET` 并降级不崩溃，JSON 容错解析（剥代码块 / 截取花括号）
+- **在线提交后端**：边缘函数 API（提交 / 进度查询 / 管线 action 分发 / 图片端点 / AI 生成驱动）+ KV 持久化 + 飞书通知，140 项本地测试通过
+- **真实 AI 生成管线（v1.7）**：`drive` action 在边缘函数内直连 **Moonshot kimi-k3 文本生成**（默认模型 kimi-k3，`reasoning_effort=low` 控制推理时长；思考 token 计入 max_tokens 已留余量；429 引擎过载自动退避重试 2 次）与**速创官方异步生图 API**（`api.wuyinkeji.com`，GPT-Image-2，Authorization 头裸 key）——大纲 3 批（设定→人物→五幕）、分集梗概每批 12 集、完整剧本每批 1 集（2 场景×4-5 行对白）、视觉资产 1 批 prompt + 逐张生图。速创走官方任务协议：POST `/image_gpt` 提交 → GET `/detail` 轮询（status 0/1 生成中 / 2 完成 / 3 失败）→ 带 Referer 防盗链头下载成品图（JPEG/PNG 校验 / 2KB-900KB / 直接入 KV），任务超 10 分钟僵死自动重提。实时显示批次子进度（第 N/3 批、N/72 集、N/5 张）；90 秒分布式锁防并发 + 55 秒 fetch 超时保护（超时/网络错自动重试，进度增量保存不丢批次），密钥未配置返回 `*_KEY_UNSET` 并降级不崩溃，速创余额不足返回含充值指引的友好错误（充值后无需改码自动恢复），JSON 容错解析（剥代码块 / 截取花括号）。本地 140 项断言（含速创协议 mock：提交/轮询/下载三拍 + 余额不足场景）；真实密钥全链路 E2E（`tools/e2e-real.mjs`）：Kimi k3 大纲/梗概/剧本真实生成 + 5 张真图 + 发布
 - **五阶段编辑确认管线**：AI 生成 → 在线编辑（大纲全字段 / 梗概逐格 / 剧本逐集模块化）→ 确认后自动进入下一阶段 → 视觉资产（可跳过生图）→ 发布上线（飞书文档 + 线上剧本库）
 - **提交即入编辑管线（v1.5）**：提交成功返回 16 位编辑密钥（服务端仅存哈希），成功页展示密钥 + 深链按钮 + 8 秒倒计时自动跳转；工作台门禁双模式（管理员令牌 / 提交者编号+密钥），各内容阶段提供「请求 AI 撰写」默认按钮（empty → requested），空状态亦可直接手动填写保存推进
 - **管线进度全面可视化（v1.6）**：详情页总体进度条（5 阶段加权完成度 + 已持续时长）；时间轴节点升级（图标 / 完成时间戳 / 连接线按状态着色 / 当前节点脉冲动画 / 剧本阶段 N/总集子进度）；等待态可视化（沙漏动画 + 已等待时长秒级跳动 + 剧本生成进度条 + 15 秒自动轮询含倒计时，有未保存编辑自动暂停）；进度事件流（后端 rec.events 记录提交/请求生成/已生成/确认推进/资产选择/图片上传/上线等动作，上限 60 条，前端渲染可折叠活动时间线）；已完成阶段节点可点击查看只读统计摘要；管理员列表每行 6 段式迷你进度轨道 + 总完成度；提交者查询页（script-new.html）从一行文字升级为六节点步进器 + 进度条（公开 GET 补充 stageStatuses，不含任何内容/联系方式）

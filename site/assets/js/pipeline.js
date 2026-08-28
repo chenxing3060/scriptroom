@@ -1008,7 +1008,9 @@
     (function loop() {
       if (stopped || state.rec == null) { state.driveLoopOn = false; return; }
       if (state.dirty) { tip('检测到未保存的编辑，自动生成已暂停——保存后自动继续'); setTimeout(loop, 3000); return; }
-      tip('AI 正在生成当前批次（每批约 10-20 秒，完成后自动推进，无需手动刷新）…');
+      tip(stage === 'assets'
+        ? '速创异步生图中（每张约 30-120 秒，完成后自动入库并推进，无需手动刷新）…'
+        : 'AI 正在生成当前批次（每批约 10-30 秒，完成后自动推进，无需手动刷新）…');
       api('PATCH', '/api/submissions/' + state.rec.id, { action: 'drive' }).then(function (j) {
         if (stopped) return;
         var prevStage = stage;

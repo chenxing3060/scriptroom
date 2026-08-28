@@ -404,6 +404,13 @@ function mockJpeg(kb) {
   b[0] = 0xff; b[1] = 0xd8; b[n - 2] = 0xff; b[n - 1] = 0xd9;
   return new Response(b.buffer, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
 }
+/* 速创官方异步协议 mock（api.wuyinkeji.com）：
+   POST /api/async/image_gpt（Authorization 头裸 key）→ {code:200,data:{id}}
+   GET  /api/async/detail?key=&id= → 首拍 status 1（生成中），次拍 status 2（完成，result 给 URL）
+   GET  成品 URL → JPEG 字节 */
+const scJson = (o) => new Response(JSON.stringify(o), { status: 200, headers: { 'Content-Type': 'application/json' } });
+let scSeq = 0;
+const scState = {};
 
 globalThis.fetch = async function (url, opt) {
   const u = String(url);
@@ -431,9 +438,31 @@ globalThis.fetch = async function (url, opt) {
     if (p.includes('视觉资产')) return mockKimi(JSON.stringify({ key_art: 'ka', char_lead: 'cl', char_second: 'cs', scene_main: 'sm', scene_twist: 'st' }));
     return mockKimi('{}');
   }
-  if (u.includes('mchost.guru')) {
+  if (u.includes('wuyinkeji.com')) {
     imgCalls++;
-    if (!u.includes('api_key=test-img-key')) return new Response(JSON.stringify({ code: 1001 }), { status: 401 });
+    if (u.includes('/api/async/image_gpt')) {
+      const auth = (opt.headers || {}).Authorization;
+      if (auth === 'test-broke-key') return scJson({ code: 400, msg: '请求失败，账户余额不足或没有权限', data: null });
+      if (auth !== 'test-img-key') return scJson({ code: 403, msg: '请求密钥KEY不正确！', data: null });
+      scSeq++;
+      const id = 'image_mock_' + scSeq;
+      scState[id] = { polls: 0 };
+      return scJson({ code: 200, msg: '成功', data: { id, count: 10 } });
+    }
+    if (u.includes('/api/async/detail')) {
+      const q = new URL(u);
+      const id = q.searchParams.get('id');
+      if (q.searchParams.get('key') !== 'test-img-key') return scJson({ code: 403, msg: '请求密钥KEY不正确！', data: null });
+      const st = scState[id] || (scState[id] = { polls: 0 });
+      st.polls++;
+      if (st.polls < 2) return scJson({ code: 200, msg: '成功', data: { task_id: id, status: 1, result: [] } });
+      return scJson({ code: 200, msg: '成功', data: { task_id: id, status: 2, result: ['https://scapi.net/mock_' + id + '.png'] } });
+    }
+    return scJson({ code: 404, msg: '未知端点' });
+  }
+  if (u.includes('scapi.net')) {
+    imgCalls++;
+    if (!String((opt.headers || {}).Referer || '').includes('wuyinkeji.com')) return new Response('forbidden', { status: 403 });
     return mockJpeg(3);
   }
   return realFetch(url, opt);
@@ -499,13 +528,19 @@ d = await D(IDG, { action: 'assets-choice', choice: 'generate' });
 check('选择生成资产 → generating', d.j.stageStatus === 'generating');
 
 d = await D(IDG, { action: 'drive' });
-check('drive 资产第1张 → key_art 入库 + 1/5', d.status === 200 && d.j.submission.stages.assets.content.items.length === 1 && d.j.submission.stages.assets.content.items[0].key === 'key_art');
+check('drive 首拍提交速创任务 → generating + imgTask 记录', d.status === 200 && d.j.stageStatus === 'generating' && d.j.submission.stages.assets.content.items.length === 0 && d.j.submission.stages.assets.imgTask && d.j.submission.stages.assets.imgTask.key === 'key_art');
+check('pendingImg 记录 + 事件流提示轮询', d.j.submission.stages.assets.pendingImg === 'key_art' && d.j.submission.events.some((e) => e.type === 'progress' && /轮询/.test(e.label || '')));
+d = await D(IDG, { action: 'drive' });
+check('drive 第2拍轮询 → 任务处理中仍 generating', d.j.stageStatus === 'generating' && d.j.submission.stages.assets.content.items.length === 0 && d.j.submission.stages.assets.imgTask);
+d = await D(IDG, { action: 'drive' });
+check('drive 第3拍取到真图 → key_art 入库 + 1/5', d.status === 200 && d.j.submission.stages.assets.content.items.length === 1 && d.j.submission.stages.assets.content.items[0].key === 'key_art');
+check('入库后 imgTask/pendingImg 清理', !d.j.submission.stages.assets.imgTask && !d.j.submission.stages.assets.pendingImg);
 const kvImg = await globalThis.SUBMISSIONS_KV.get('sub_' + IDG + '_img_key_art', { type: 'arrayBuffer' });
 check('图片已写入 KV（JPEG bytes）', kvImg && kvImg.byteLength === 3 * 1024 && new Uint8Array(kvImg)[0] === 0xff);
 
-for (let i = 0; i < 4; i++) d = await D(IDG, { action: 'drive' });
+for (let i = 0; i < 12; i++) d = await D(IDG, { action: 'drive' });
 check('drive 5 张图全部完成 → 待确认', d.j.stageStatus === 'pending_review' && d.j.submission.stages.assets.content.items.length === 5);
-check('速创调用 5 次（api_key 鉴权）', imgCalls === 5);
+check('速创调用 20 次（每张 提交1+轮询2+下载1，key 鉴权）', imgCalls === 20, 'imgCalls=' + imgCalls);
 check('Kimi 调用计数合理（大纲3+梗概6+剧本1+资产prompt1=11）', kimiCalls === 11, 'kimiCalls=' + kimiCalls);
 check('资产阶段仅 prompt 批次调用 Kimi（图片不消耗文本调用）', kimiCalls === beforeCalls + 1, 'kimiCalls=' + kimiCalls + ' before=' + beforeCalls);
 
@@ -554,6 +589,11 @@ await D(IDZ, { action: 'decision', stage: 'script', decision: 'approved' }, envN
 await D(IDZ, { action: 'assets-choice', choice: 'generate' }, envNoImgKey);
 d = await D(IDZ, { action: 'drive' }, envNoImgKey);
 check('未配 SUCHUANG_API_KEY → KEY_UNSET 错误', d.status === 200 && /SUCHUANG_KEY_UNSET/.test(d.j.error || ''));
+
+/* 速创账户余额不足（当前真实账户状态）→ 友好错误 + 充值指引 */
+const envBroke = { ...env, KIMI_API_KEY: 'k', SUCHUANG_API_KEY: 'test-broke-key' };
+d = await D(IDZ, { action: 'drive' }, envBroke);
+check('速创余额不足 → 友好错误（含充值指引，充值后无需改码）', d.status === 200 && /余额不足.*充值/.test(d.j.error || ''), 'error=' + (d.j.error || ''));
 
 globalThis.fetch = realFetch;
 

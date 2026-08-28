@@ -62,8 +62,8 @@ function adminOk(request, env) {
   return { ok: true };
 }
 
-async function sha256Hex(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+async function sha256Hex(data) {
+  const buf = await crypto.subtle.digest('SHA-256', typeof data === 'string' ? new TextEncoder().encode(data) : data);
   return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
 }
 
@@ -197,22 +197,54 @@ const GEN_SYS = '你是北美本土竖屏女频短剧（60-80集）的资深编�
 const LOCK_MS = 90 * 1000;
 const SYN_BATCH = 12;   // 梗概每批集数（单批 ≤12s 约束下 ≤600 输出 token）
 const OUTLINE_STEPS = 3; // 大纲拆 3 批：设定 / 人物 / 五幕
+const FETCH_TIMEOUT_MS = 55 * 1000; // 单次上游调用超时，防边缘函数被平台时长上限掐断（前端会自动重试）
 
-/* Moonshot（OpenAI 兼容）非流式调用，json_object 模式；不传 temperature（k 系列仅允许 1） */
+/* 带超时的 fetch（AbortController 手动实现，兼容各边缘运行时）；超时/网络错误返回 {err} */
+async function fetchT(url, opt, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(function () { ctrl.abort(); }, ms);
+  try {
+    return await fetch(url, Object.assign({}, opt, { signal: ctrl.signal }));
+  } catch (e) {
+    const name = (e && e.name) || 'network';
+    return { err: name === 'AbortError' ? 'FETCH_TIMEOUT（>' + Math.round(ms / 1000) + 's，稍后自动重试）' : 'FETCH_FAIL（' + name + '）' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* Moonshot（OpenAI 兼容）非流式调用，json_object 模式；不传 temperature（k 系列仅允许 1）。
+   默认 kimi-k3（纯思考模型，默认 effort=max 太慢）：降 reasoning_effort=low，单批 10-30s；
+   思考 token 计入 max_tokens，调用侧已给足余量；content 为干净 JSON */
 async function kimiChat(env, userPrompt, maxTokens) {
   const key = env.KIMI_API_KEY || '';
   if (!key) return { err: 'KIMI_KEY_UNSET（请在项目环境变量配置 KIMI_API_KEY）' };
   const baseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
-  const model = env.KIMI_MODEL || 'moonshot-v1-32k';
-  const res = await fetch(baseUrl + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: model,
-      messages: [{ role: 'system', content: GEN_SYS }, { role: 'user', content: userPrompt }],
-      max_tokens: maxTokens, response_format: { type: 'json_object' },
-    }),
-  });
+  const model = env.KIMI_MODEL || 'kimi-k3';
+  const body = {
+    model: model,
+    messages: [{ role: 'system', content: GEN_SYS }, { role: 'user', content: userPrompt }],
+    max_tokens: maxTokens, response_format: { type: 'json_object' },
+  };
+  if (/^kimi-k/.test(model)) body.reasoning_effort = 'low';
+  /* 429 引擎过载自动退避重试（最多 2 次），仍失败则透出错误由前端 8s 循环兜底 */
+  let res = null, last429 = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise(function (r) { setTimeout(r, 5000); });
+    res = await fetchT(baseUrl + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, FETCH_TIMEOUT_MS);
+    if (res.err) return { err: 'KIMI_' + res.err };
+    if (res.status !== 429) break;
+    last429 = res;
+  }
+  if (res.status === 429) {
+    let m429 = '';
+    try { m429 = ((await last429.json()) || {}).error || {}; } catch (_) {}
+    return { err: 'KIMI_HTTP_429' + (m429.message ? '：' + String(m429.message).slice(0, 80) : '（引擎过载，稍后自动重试）') };
+  }
   if (!res.ok) {
     let msg = '';
     try { msg = ((await res.json()) || {}).error || {}; } catch (_) {}
@@ -236,22 +268,76 @@ function parseJsonLoose(s) {
   return null;
 }
 
-/* 速创生图：跟随重定向，api_key 走 query（重定向安全），返回 base64 */
-async function genImage(env, prompt, size) {
+/* 速创官方异步生图 API（api.wuyinkeji.com，GPT-Image-2，0.1 元/张）：
+   ① POST /image_gpt（Authorization 头裸 key）→ {code:200,data:{id}}
+   ② GET  /detail?key=..&id=.. → {code:200,data:{status,result:[url]}}（status 0/1 生成中 2 完成 3 失败）
+   ③ GET  result url（需 Referer 防盗链头）→ 图片字节（JPEG 或 PNG） */
+const SC_API_BASE = 'https://api.wuyinkeji.com/api/async';
+const SC_SIZE_MAP = {
+  square: '1:1', portrait_4_3: '3:4', portrait_16_9: '9:16',
+  landscape_4_3: '4:3', landscape_16_9: '16:9',
+};
+
+function scBase(env) { return String(env.SUCHUANG_API_BASE || SC_API_BASE).replace(/\/+$/, ''); }
+
+function scErrMsg(code, msg) {
+  const m = String(msg || '');
+  if (code === 403) return '速创密钥无效（请检查 SUCHUANG_API_KEY）';
+  if (code === 400 && /余额|权限/.test(m)) return '速创账户余额不足或未开通生图产品（请在速创控制台充值，0.1 元/张，充值后自动恢复无需改码）';
+  return '速创 ' + code + (m ? '：' + m.slice(0, 80) : '');
+}
+
+/* 提交异步生图任务 → {taskId} */
+async function scSubmit(env, prompt, size) {
   const key = env.SUCHUANG_API_KEY || '';
   if (!key) return { err: 'SUCHUANG_KEY_UNSET（请在项目环境变量配置 SUCHUANG_API_KEY）' };
-  const api = env.SUCHUANG_IMAGE_API || 'https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image';
-  const url = api + '?prompt=' + encodeURIComponent(String(prompt).slice(0, 600)) +
-    '&image_size=' + encodeURIComponent(size || 'square') + '&api_key=' + encodeURIComponent(key);
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) return { err: 'IMG_HTTP_' + res.status };
+  const ep = env.SUCHUANG_IMAGE_EP || 'image_gpt';
+  const res = await fetchT(scBase(env) + '/' + ep, {
+    method: 'POST',
+    headers: { 'Authorization': key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: String(prompt).slice(0, 3000), size: SC_SIZE_MAP[size] || '1:1' }),
+  }, FETCH_TIMEOUT_MS);
+  if (res.err) return { err: 'SC_SUBMIT_' + res.err };
+  if (!res.ok) return { err: 'SC_SUBMIT_HTTP_' + res.status };
+  let j;
+  try { j = await res.json(); } catch (_) { return { err: 'SC_SUBMIT_BAD_JSON' }; }
+  if (j.code !== 200 || !(j.data && j.data.id)) return { err: scErrMsg(j.code, j.msg) };
+  return { taskId: String(j.data.id) };
+}
+
+/* 轮询任务 → {pending:true} 生成中 / {urls:[...]} 完成 / {err} 失败 */
+async function scPoll(env, taskId) {
+  const key = env.SUCHUANG_API_KEY || '';
+  const res = await fetchT(scBase(env) + '/detail?key=' + encodeURIComponent(key) + '&id=' + encodeURIComponent(taskId), {}, FETCH_TIMEOUT_MS);
+  if (res.err) return { err: 'SC_POLL_' + res.err };
+  if (!res.ok) return { err: 'SC_POLL_HTTP_' + res.status };
+  let j;
+  try { j = await res.json(); } catch (_) { return { err: 'SC_POLL_BAD_JSON' }; }
+  if (j.code !== 200) return { err: scErrMsg(j.code, j.msg) };
+  const d = j.data || {};
+  if (Number(d.status) === 2) {
+    const urls = Array.isArray(d.result) ? d.result.filter(function (u) { return typeof u === 'string' && u; }) : [];
+    if (!urls.length) return { err: 'SC_EMPTY_RESULT（任务完成但无图片 URL）' };
+    return { urls: urls };
+  }
+  if (Number(d.status) === 3) return { err: 'SC_TASK_FAILED（速创生图任务失败）' };
+  return { pending: true };
+}
+
+/* 下载成品图（带防盗链头）→ {bytes,mime}；KV 单值上限内校验 */
+async function scDownload(env, url) {
+  const res = await fetchT(url, {
+    headers: { 'Referer': 'https://api.wuyinkeji.com/', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
+  }, FETCH_TIMEOUT_MS);
+  if (res.err) return { err: 'SC_DL_' + res.err };
+  if (!res.ok) return { err: 'SC_DL_HTTP_' + res.status };
   const bytes = new Uint8Array(await res.arrayBuffer());
-  if (bytes.length < 2048) return { err: 'IMG_TOO_SMALL（疑似占位图）' };
-  if (bytes.length > 400 * 1024) return { err: 'IMG_TOO_LARGE（' + Math.round(bytes.length / 1024) + 'KB > 400KB）' };
-  if (!(bytes[0] === 0xff && bytes[1] === 0xd8)) return { err: 'IMG_NOT_JPEG' };
-  let bin = '';
-  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
-  return { b64: btoa(bin) };
+  if (bytes.length < 2048) return { err: 'SC_IMG_TOO_SMALL（' + bytes.length + 'B）' };
+  if (bytes.length > 900 * 1024) return { err: 'SC_IMG_TOO_LARGE（' + Math.round(bytes.length / 1024) + 'KB > 900KB，超 KV 单值上限）' };
+  const isJpg = bytes[0] === 0xff && bytes[1] === 0xd8;
+  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  if (!isJpg && !isPng) return { err: 'SC_IMG_NOT_IMAGE（非 JPEG/PNG）' };
+  return { bytes: bytes, mime: isJpg ? 'image/jpeg' : 'image/png' };
 }
 
 function outlineCtx(rec) {
@@ -278,7 +364,7 @@ async function genOutlineStep(store, rec, env) {
     r = await kimiChat(env, ctx.brief + '\n\n生成本剧大纲的基础设定 JSON（本次只做设定，不含人物与分幕）：\n' +
       '{"logline":"英文一句话 logline","loglineZh":"中文一句话","genreTags":["3个英文题材标签"],"' +
       'setting":"世界观设定120字（时代/地点/规则/氛围）","themes":["3个核心主题词"],"' +
-      'cpDynamics":"主角关系与推拉动力学120字","paywallStrategy":"付费卡点策略100字（卡点密度与钩子类型）"}\n只输出 JSON。', 900);
+      'cpDynamics":"主角关系与推拉动力学120字","paywallStrategy":"付费卡点策略100字（卡点密度与钩子类型）"}\n只输出 JSON。', 3500);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !parsed.setting) throw new Error('大纲设定批次结构不完整');
@@ -290,7 +376,7 @@ async function genOutlineStep(store, rec, env) {
     r = await kimiChat(env, ctx.brief + '\n已有设定：' + JSON.stringify(entry.content).slice(0, 900) +
       '\n\n基于以上设定生成 6 个主要人物 JSON：\n' +
       '{"mainChars":[{"name":"英文名","role":"身份/立场","want":"核心欲望","flaw":"性格缺陷","arc":"成长弧光"}]}\n' +
-      '恰好 6 人：男女主 + 各 1 个核心对手 + 2 个关键配角。只输出 JSON。', 900);
+      '恰好 6 人：男女主 + 各 1 个核心对手 + 2 个关键配角。只输出 JSON。', 4000);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !Array.isArray(parsed.mainChars) || parsed.mainChars.length < 4) throw new Error('人物批次结构不完整');
@@ -300,7 +386,7 @@ async function genOutlineStep(store, rec, env) {
   } else {
     r = await kimiChat(env, ctx.brief + '\n已有设定与人物：' + JSON.stringify(entry.content).slice(0, 1600) +
       '\n\n生成五幕主线结构 JSON（恰好 5 幕，eps 覆盖 1 到 ' + total + ' 集且连续不重叠）：\n' +
-      '{"fiveActs":[{"act":"第一幕","title":"幕标题","eps":"1-14","summary":"本幕剧情120字","keyTurns":["转折1","转折2"]}]}\n只输出 JSON。', 1000);
+      '{"fiveActs":[{"act":"第一幕","title":"幕标题","eps":"1-14","summary":"本幕剧情120字","keyTurns":["转折1","转折2"]}]}\n只输出 JSON。', 4000);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !Array.isArray(parsed.fiveActs) || parsed.fiveActs.length < 4) throw new Error('五幕批次结构不完整');
@@ -342,7 +428,7 @@ async function genSynopsisStep(store, rec, env) {
     '\n人物：' + (ctx.chars || '未提供') +
     (prev ? '\n前情（最后2集钩子，需衔接）：\n' + prev : '') +
     '\n\n生成第 ' + from + ' 至 ' + to + ' 集的分集梗概 JSON（恰好 ' + (to - from + 1) + ' 集，ep 连续）：\n' +
-    '{"episodes":[{"ep":' + from + ',"title":"英文短集名","hook":"结尾钩子（本集最后悬念）40字内","beat":"本集剧情节拍70字","paymark":"付费卡点标记，如 第3卡；无卡点则空字符串"}]}\n只输出 JSON。', 1800);
+    '{"episodes":[{"ep":' + from + ',"title":"英文短集名","hook":"结尾钩子（本集最后悬念）40字内","beat":"本集剧情节拍70字","paymark":"付费卡点标记，如 第3卡；无卡点则空字符串"}]}\n只输出 JSON。', 6000);
   if (r.err) throw new Error(r.err);
   const parsed = parseJsonLoose(r.text);
   if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('梗概批次结构不完整');
@@ -395,7 +481,7 @@ async function genScriptStep(store, rec, env) {
     '\n本集梗概：' + need.map(function (e) { return 'EP' + e.ep + '《' + e.title + '》节拍：' + (e.beat || '') + '；结尾钩子：' + (e.hook || ''); }).join('\n') +
     '\n\n撰写第 ' + from + ' 集完整剧本 JSON：\n' +
     '{"episodes":[{"ep":' + from + ',"title":"沿用梗概英文集名","hook":"本集结尾钩子","scenes":[{"no":1,"slug":"INT. 场景名 - 日/夜","action":"场景与动作描述","lines":[{"s":"角色英文名","l":"英文台词（北美口语）","lZh":"中文台词"}]},{"no":2,"slug":"EXT. 场景名 - 日/夜","action":"...","lines":[...]}]}]}\n' +
-    '恰好 2 个场景、每场景 4-5 行对白，只输出 JSON。', 1600);
+    '恰好 2 个场景、每场景 4-5 行对白，只输出 JSON。', 6000);
   if (r.err) throw new Error(r.err);
   const parsed = parseJsonLoose(r.text);
   if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('剧本批次结构不完整');
@@ -448,7 +534,7 @@ async function genAssetsStep(store, rec, env) {
     const r = await kimiChat(env, ctx.brief + '\n设定：' + String(ctx.o.setting || '').slice(0, 200) +
       '\n人物：' + (ctx.chars || '') +
       '\n\n为本剧生成 5 张视觉资产的英文生图 prompt JSON（每条 50-80 词，统一 cinematic 短剧海报风格，含主体/构图/光线/情绪，不含文字水印描述）：\n' +
-      '{"key_art":"主视觉海报 prompt（男女主同框张力构图）","char_lead":"主角单人立绘 prompt","char_second":"对手单人立绘 prompt","scene_main":"核心场景概念图 prompt","scene_twist":"高潮剧情概念图 prompt"}\n只输出 JSON。', 1000);
+      '{"key_art":"主视觉海报 prompt（男女主同框张力构图）","char_lead":"主角单人立绘 prompt","char_second":"对手单人立绘 prompt","scene_main":"核心场景概念图 prompt","scene_twist":"高潮剧情概念图 prompt"}\n只输出 JSON。', 3500);
     if (r.err) throw new Error(r.err);
     const prompts = parseJsonLoose(r.text);
     if (prompts) entry.content.prompts = prompts;
@@ -456,17 +542,59 @@ async function genAssetsStep(store, rec, env) {
 
   const plan = remaining[0];
   const prompt = (entry.content.prompts && entry.content.prompts[plan.key]) || ('cinematic short drama poster, ' + (ctx.o.logline || rec.idea || rec.title));
-  const img = await genImage(env, prompt, plan.size);
-  if (img.err) throw new Error(img.err);
-  await store.put(PREFIX + rec.id + '_img_' + plan.key, base64ToBytes(img.b64));
-  items.push({ key: plan.key, label: plan.label, aspect: plan.size, mime: 'image/jpeg' });
-  entry.status = items.length >= ASSET_PLAN.length ? 'pending_review' : 'generating';
-  entry.progress = { total: ASSET_PLAN.length, done: items.length };
+
+  /* ① 已有本图的进行中任务 → 轮询（status 0/1 生成中 2 完成 3 失败）；超 10 分钟视为僵死任务自动重提 */
+  const task = entry.imgTask && entry.imgTask.id && entry.imgTask.key === plan.key ? entry.imgTask : null;
+  if (task && Date.now() - new Date(task.at).getTime() > 10 * 60 * 1000) {
+    addEvent(rec, 'progress', 'assets', plan.label + ' 生图任务超时，自动重新提交');
+    delete entry.imgTask;
+    delete entry.pendingImg;
+    await saveRecord(store, rec);
+  } else if (task) {
+    const p = await scPoll(env, task.id);
+    if (p.err) {
+      delete entry.imgTask;
+      throw new Error(p.err);
+    }
+    if (p.pending) {
+      if (entry.pendingImg !== plan.key) {
+        entry.pendingImg = plan.key;
+        addEvent(rec, 'progress', 'assets', plan.label + ' 速创生图中（任务已提交，自动轮询取图）');
+      }
+      entry.updatedAt = new Date().toISOString();
+      await saveRecord(store, rec);
+      return { data: { stage: 'assets', stageStatus: 'generating', generating: true, submission: rec } };
+    }
+    /* 完成 → 下载真图入库 */
+    const dl = await scDownload(env, p.urls[0]);
+    if (dl.err) {
+      delete entry.imgTask;
+      throw new Error(dl.err);
+    }
+    delete entry.imgTask;
+    delete entry.pendingImg;
+    await store.put(PREFIX + rec.id + '_img_' + plan.key, dl.bytes);
+    items.push({ key: plan.key, label: plan.label, aspect: plan.size, mime: dl.mime });
+    entry.status = items.length >= ASSET_PLAN.length ? 'pending_review' : 'generating';
+    entry.progress = { total: ASSET_PLAN.length, done: items.length };
+    entry.updatedAt = new Date().toISOString();
+    touch(rec);
+    addEvent(rec, 'asset', 'assets', '速创生图完成：' + plan.label + '（' + items.length + '/' + ASSET_PLAN.length + '）');
+    await saveRecord(store, rec);
+    return { data: { stage: 'assets', stageStatus: entry.status, generated: entry.status === 'pending_review', submission: rec } };
+  }
+
+  /* ② 无进行中任务 → 提交新的异步生图任务，下一拍轮询 */
+  if (entry.imgTask) delete entry.imgTask;
+  const s = await scSubmit(env, prompt, plan.size);
+  if (s.err) throw new Error(s.err);
+  entry.imgTask = { id: s.taskId, key: plan.key, at: new Date().toISOString() };
+  entry.pendingImg = plan.key;
   entry.updatedAt = new Date().toISOString();
   touch(rec);
-  addEvent(rec, 'asset', 'assets', 'AI 生成：' + plan.label + '（' + items.length + '/' + ASSET_PLAN.length + '）');
+  addEvent(rec, 'progress', 'assets', plan.label + ' 已提交速创生图任务（每张约 30-120 秒，自动轮询）');
   await saveRecord(store, rec);
-  return { data: { stage: 'assets', stageStatus: entry.status, generated: entry.status === 'pending_review', submission: rec } };
+  return { data: { stage: 'assets', stageStatus: 'generating', generating: true, submission: rec } };
 }
 
 /* ---- action：驱动一拍生成（前端等待态循环调用） ---- */
