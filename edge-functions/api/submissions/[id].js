@@ -123,6 +123,12 @@ function touch(rec) {
   rec.updatedAt = new Date().toISOString();
 }
 
+function addEvent(rec, type, stage, label) {
+  if (!Array.isArray(rec.events)) rec.events = [];
+  rec.events.push({ t: new Date().toISOString(), type: type, stage: stage || '', label: clean(label, 80) });
+  if (rec.events.length > 60) rec.events = rec.events.slice(-60);
+}
+
 async function loadRecord(store, id) {
   const raw = await store.get(PREFIX + id);
   if (!raw) return null;
@@ -233,6 +239,7 @@ async function onRequestGet(context) {
     createdAt: rec.createdAt,
     updatedAt: rec.updatedAt || rec.createdAt,
   }, stageSummary(rec));
+  pub.stageStatuses = stageStatuses(rec);
   return json(pub);
 }
 
@@ -330,6 +337,9 @@ async function actStageContent(store, rec, body) {
   const cur = stageOf(rec);
   if (STAGE_ORDER.indexOf(stage) > STAGE_ORDER.indexOf(cur)) rec.stage = stage;
   touch(rec);
+  if (ready) addEvent(rec, 'ready', stage, '「' + STAGE_LABELS[stage] + '」已生成');
+  else if (stage === 'script' && entry.progress)
+    addEvent(rec, 'progress', stage, '剧本已写 ' + entry.progress.written + '/' + entry.progress.total + ' 集');
   await saveRecord(store, rec);
   return { data: { stage: stage, stageStatus: entry.status, progress: entry.progress || null }, notify: { type: 'ready', stage: stage, stageLabel: STAGE_LABELS[stage] } };
 }
@@ -347,6 +357,7 @@ async function actRequestGenerate(store, rec, body) {
   entry.status = 'requested';
   entry.updatedAt = new Date().toISOString();
   touch(rec);
+  addEvent(rec, 'request', stage, '请求 AI 撰写「' + STAGE_LABELS[stage] + '」');
   await saveRecord(store, rec);
   return { data: { stage: stage, stageStatus: 'requested' }, notify: { type: 'request', stage: stage, stageLabel: STAGE_LABELS[stage] } };
 }
@@ -389,6 +400,9 @@ async function actDecision(store, rec, body) {
     notify.nextLabel = STAGE_LABELS[rec.stage];
   }
   touch(rec);
+  addEvent(rec, decision, stage, decision === 'approved'
+    ? '「' + STAGE_LABELS[stage] + '」已确认' + (notify.next ? ' → ' + notify.nextLabel : '')
+    : '「' + STAGE_LABELS[stage] + '」被驳回');
   await saveRecord(store, rec);
   return { data: Object.assign({ decided: stage, decision: decision }, stageSummary(rec)), notify: notify };
 }
@@ -443,6 +457,7 @@ async function actAssetsChoice(store, rec, body) {
   }
   entry.updatedAt = new Date().toISOString();
   touch(rec);
+  addEvent(rec, 'assets-choice', 'assets', choice === 'skip' ? '跳过视觉资产生成' : '开始生成视觉资产');
   await saveRecord(store, rec);
   return { data: { choice: choice, stageStatus: entry.status, stage: rec.stage }, notify: { type: 'assets-choice', choice: choice } };
 }
@@ -478,6 +493,7 @@ async function actAssetPut(store, rec, body) {
   if (entry.status === 'rejected') entry.status = 'generating';
   entry.updatedAt = new Date().toISOString();
   touch(rec);
+  addEvent(rec, 'asset', 'assets', '已上传：' + meta.label);
   await saveRecord(store, rec);
   return { data: { key: key, items: entry.content.items.length } };
 }
@@ -494,6 +510,7 @@ async function actPublishDone(store, rec, body) {
   rec.stage = 'done';
   rec.status = 'published';
   touch(rec);
+  addEvent(rec, 'published', 'publish', '剧本已上线');
   await saveRecord(store, rec);
   return { data: { stage: 'done', feishuDocUrl: feishuDocUrl, pageUrl: pageUrl }, notify: { type: 'published', feishuDocUrl: feishuDocUrl, pageUrl: pageUrl } };
 }
@@ -505,6 +522,7 @@ async function actLegacyStatus(store, rec, body) {
   rec.status = status;
   rec.statusNote = typeof body.note === 'string' ? body.note.trim().slice(0, 300) : '';
   touch(rec);
+  addEvent(rec, 'status', stageOf(rec), '状态 → ' + (STATUS_LABELS[status] || status));
   await saveRecord(store, rec);
   return { data: { id: rec.id, status: rec.status, statusLabel: STATUS_LABELS[rec.status], statusNote: rec.statusNote } };
 }

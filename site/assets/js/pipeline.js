@@ -17,7 +17,10 @@
     rebirth: '重生复仇', 'hidden-identity': '隐藏身份', contract: '契约婚姻',
   };
 
-  var state = { token: '', role: 'admin', editKey: '', editId: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false };
+  var STAGE_ICONS = { outline: '📌', synopsis: '🗂️', script: '🎬', assets: '🖼️', publish: '🚀', done: '🏁' };
+  var POLL_SECS = 15;
+
+  var state = { token: '', role: 'admin', editKey: '', editId: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false, sumStage: '', waitTimer: null, pollTimer: null };
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -46,6 +49,97 @@
   function stageOfRec(rec) { return rec && rec.stage && STAGE_LABELS[rec.stage] ? rec.stage : 'outline'; }
   function entryOf(rec, stage) { return (rec && rec.stages && rec.stages[stage]) || null; }
   function statusOf(rec, stage) { var e = entryOf(rec, stage); return e && e.status ? e.status : 'empty'; }
+
+  /* 列表 item 的阶段状态（无 stages 结构，读 stageStatuses） */
+  function itemStatus(item, stage) {
+    if (item.stageStatuses && item.stageStatuses[stage]) return item.stageStatuses[stage];
+    if (stage === item.stage) return item.stageStatus || 'empty';
+    return 'empty';
+  }
+
+  /* 阶段子进度 0-1（lite=true 时 script/assets 用简化档，供列表页无 stages 内容时用） */
+  function stageFracByStatus(stage, st, entry, lite) {
+    if (stage === 'outline' || stage === 'synopsis') {
+      if (st === 'approved') return 1;
+      if (st === 'pending_review' || st === 'rejected') return 0.85;
+      if (st === 'requested' || st === 'draft') return 0.15;
+      return 0;
+    }
+    if (stage === 'script') {
+      if (st === 'approved' || st === 'pending_review' || st === 'rejected') return 1;
+      if (st === 'requested') return 0.1;
+      if (st === 'draft') {
+        if (lite) return 0.5;
+        var p = entry && entry.progress;
+        var w = p ? Number(p.written) || 0 : 0;
+        var t = p ? Number(p.total) || 0 : 0;
+        return t ? Math.min(w / t, 0.9) : 0.5;
+      }
+      return 0;
+    }
+    if (stage === 'assets') {
+      if (st === 'approved' || st === 'skipped' || st === 'pending_review' || st === 'rejected') return 1;
+      if (st === 'awaiting_choice') return 0.2;
+      if (st === 'generating') {
+        if (lite) return 0.55;
+        var items = entry && entry.content && entry.content.items;
+        return Math.min((items ? items.length : 0) / 5, 0.9);
+      }
+      return 0;
+    }
+    if (stage === 'publish') {
+      if (st === 'done') return 1;
+      if (st === 'pending') return 0.5;
+      return 0;
+    }
+    return 0;
+  }
+
+  /* 总体进度：5 个内容阶段各占 20%；rec 可为详情记录或列表 item */
+  function overallProgress(rec, lite) {
+    var cur = stageOfRec(rec);
+    if (cur === 'done') return { pct: 100, stageNo: '已完成', stageLabel: '已完成' };
+    var order = ['outline', 'synopsis', 'script', 'assets', 'publish'];
+    var sum = 0;
+    for (var i = 0; i < order.length; i++) {
+      var st = rec.stages ? statusOf(rec, order[i]) : itemStatus(rec, order[i]);
+      sum += stageFracByStatus(order[i], st, rec.stages ? entryOf(rec, order[i]) : null, lite);
+    }
+    var idx = order.indexOf(cur);
+    if (idx < 0) idx = 0;
+    return { pct: Math.round(sum / order.length * 100), stageNo: '阶段 ' + (idx + 1) + '/5', stageLabel: STAGE_LABELS[cur] };
+  }
+
+  function fmtShort(iso) {
+    var t = new Date(iso);
+    if (!iso || isNaN(t.getTime())) return '';
+    function p(n) { return String(n).padStart(2, '0'); }
+    return p(t.getMonth() + 1) + '-' + p(t.getDate()) + ' ' + p(t.getHours()) + ':' + p(t.getMinutes());
+  }
+
+  function durationText(iso) {
+    var t = new Date(iso).getTime();
+    if (!iso || isNaN(t)) return '—';
+    var h = Math.max(0, (Date.now() - t) / 3600000);
+    if (h >= 48) return Math.round(h / 24) + ' 天';
+    return Math.max(1, Math.round(h)) + ' 小时';
+  }
+
+  /* 已等待时长（秒级跳动，供等待态使用） */
+  function elapsedText(iso) {
+    var t = new Date(iso).getTime();
+    if (!iso || isNaN(t)) return '—';
+    var s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (s < 60) return s + ' 秒';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
+    return Math.floor(m / 60) + ' 时 ' + (m % 60) + ' 分';
+  }
+
+  function clearTimers() {
+    if (state.waitTimer) { clearInterval(state.waitTimer); state.waitTimer = null; }
+    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  }
 
   /* ---------- 门禁：管理员令牌 / 提交者编号+密钥 ---------- */
 
@@ -149,10 +243,12 @@
   }
 
   function exitToGate() {
+    clearTimers();
     state.role = 'admin';
     state.editKey = '';
     state.editId = '';
     state.rec = null;
+    state.sumStage = '';
     history.replaceState(null, '', location.pathname);
     showGate();
   }
@@ -160,6 +256,8 @@
   /* ---------- 列表视图 ---------- */
 
   function loadList() {
+    clearTimers();
+    state.sumStage = '';
     $('#pl-detail-view').hidden = true;
     $('#pl-list-view').hidden = false;
     var box = $('#pl-list');
@@ -168,6 +266,15 @@
       state.list = j.submissions || [];
       renderList();
     }).catch(function (ex) { box.innerHTML = '<p class="pl-err">加载失败：' + esc(ex.message) + '</p>'; });
+  }
+
+  function miniTrack(r) {
+    var segs = STAGE_FLOW.map(function (s) {
+      var ss = itemStatus(r, s);
+      return '<i class="st-' + esc(ss) + '" title="' + esc(STAGE_LABELS[s] + ' · ' + (STAGE_STATUS_LABELS[ss] || ss)) + '"></i>';
+    }).join('');
+    var ov = overallProgress(r, true);
+    return '<div class="pl-mini-track">' + segs + '</div><span class="pl-badge" style="margin-left:8px">' + ov.pct + '%</span>';
   }
 
   function renderList() {
@@ -187,10 +294,11 @@
         '<td>' + esc(CATEGORIES[r.category] || r.category || '—') + '</td>' +
         '<td>' + esc(r.episodes || '?') + ' 集</td>' +
         '<td>' + badge + '</td>' +
+        '<td>' + miniTrack(r) + '</td>' +
         '<td class="pl-muted pl-time">' + esc(fmtTime(r.updatedAt || r.createdAt)) + '</td>' +
         '</tr>';
     }).join('');
-    box.innerHTML = '<div class="pl-table-wrap"><table class="pl-table"><thead><tr><th>编号</th><th>剧名</th><th>配向</th><th>母题</th><th>体量</th><th>当前阶段</th><th>更新时间</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    box.innerHTML = '<div class="pl-table-wrap"><table class="pl-table"><thead><tr><th>编号</th><th>剧名</th><th>配向</th><th>母题</th><th>体量</th><th>当前阶段</th><th>进度</th><th>更新时间</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
     $$('.pl-row', box).forEach(function (tr) {
       tr.addEventListener('click', function () { openDetail(tr.getAttribute('data-id')); });
     });
@@ -206,6 +314,8 @@
   }
 
   function loadDetail(id) {
+    clearTimers();
+    state.sumStage = '';
     $('#pl-stage-panel').innerHTML = '<p class="pl-muted">加载中…</p>';
     api('GET', '/api/submissions/' + encodeURIComponent(id)).then(function (j) {
       state.rec = j.submission;
@@ -238,19 +348,48 @@
     renderStagePanel();
   }
 
+  function eventDotClass(type) {
+    var map = { request: 'st-requested', progress: 'st-draft', ready: 'st-pending_review', approved: 'st-approved',
+      rejected: 'st-rejected', 'assets-choice': 'st-awaiting_choice', asset: 'st-generating', published: 'st-done' };
+    return map[type] || '';
+  }
+
   function renderTimeline() {
     var rec = state.rec;
     var cur = stageOfRec(rec);
+    var ov = overallProgress(rec, false);
     var nodes = STAGE_FLOW.map(function (s) {
       var ss = s === 'done' ? (cur === 'done' ? 'done' : 'empty') : statusOf(rec, s);
-      var cls = s === cur ? ' active' : '';
-      return '<div class="pl-node' + cls + ' st-' + esc(ss) + '">' +
+      var entry = entryOf(rec, s);
+      var time = entry && entry.updatedAt ? fmtShort(entry.updatedAt) : '';
+      var sub = '';
+      if (s === 'script' && entry && entry.progress) sub = entry.progress.written + '/' + entry.progress.total + ' 集';
+      var sum = (ss === 'approved' || ss === 'skipped' || ss === 'done') ? ' data-sum="' + s + '" title="点击查看阶段摘要"' : '';
+      return '<div class="pl-node' + (s === cur ? ' active' : '') + ' st-' + esc(ss) + '"' + sum + '>' +
+        '<div class="pl-node-icon">' + STAGE_ICONS[s] + '</div>' +
         '<div class="pl-node-dot"></div>' +
         '<div class="pl-node-label">' + esc(STAGE_LABELS[s]) + '</div>' +
-        '<div class="pl-node-status">' + esc(STAGE_STATUS_LABELS[ss] || ss) + '</div>' +
+        '<div class="pl-node-status">' + esc(STAGE_STATUS_LABELS[ss] || ss) + (sub ? ' · ' + esc(sub) : '') + '</div>' +
+        (time ? '<div class="pl-node-time">' + esc(time) + '</div>' : '') +
         '</div>';
     }).join('');
-    $('#pl-timeline').innerHTML = '<div class="pl-track">' + nodes + '</div>';
+    var html = '<div class="pl-overall"><div class="pl-overall-bar"><i style="width:' + ov.pct + '%"></i></div>' +
+      '<span>总体进度 ' + ov.pct + '% · ' + ov.stageNo + '（' + esc(ov.stageLabel) + '）· 已持续 ' + esc(durationText(rec.createdAt)) + '</span></div>' +
+      '<div class="pl-track">' + nodes + '</div>';
+    if (rec.events && rec.events.length) {
+      var evs = rec.events.slice().reverse().map(function (e) {
+        return '<div class="pl-event"><span class="pl-event-dot ' + esc(eventDotClass(e.type)) + '"></span>' +
+          '<span class="pl-event-time">' + esc(fmtShort(e.t)) + '</span><span>' + esc(e.label) + '</span></div>';
+      }).join('');
+      html += '<details class="pl-events-box"><summary>进度事件（' + rec.events.length + '）</summary>' + evs + '</details>';
+    }
+    $('#pl-timeline').innerHTML = html;
+    $$('#pl-timeline .pl-node[data-sum]').forEach(function (n) {
+      n.addEventListener('click', function () {
+        state.sumStage = n.getAttribute('data-sum');
+        renderStagePanel();
+      });
+    });
   }
 
   /* ---------- 阶段面板 ---------- */
@@ -260,7 +399,10 @@
   function waitHtml(title, sub) {
     return '<div class="pl-wait"><div class="pl-wait-icon">⏳</div><h3>' + esc(title) + '</h3>' +
       '<p class="pl-muted">' + esc(sub) + '</p>' +
-      '<button type="button" class="pl-btn pl-btn-ghost" id="pl-wait-reload">刷新状态</button></div>';
+      '<p class="pl-elapsed" id="pl-elapsed" hidden></p>' +
+      '<p class="pl-subbar" id="pl-wait-bar" hidden><i style="width:0%"></i></p>' +
+      '<button type="button" class="pl-btn pl-btn-ghost" id="pl-wait-reload">刷新状态</button>' +
+      '<p class="pl-poll-tip" id="pl-poll-tip" hidden></p></div>';
   }
 
   function legacyRejectedNote() {
@@ -276,7 +418,14 @@
   }
 
   function renderStagePanel() {
+    clearTimers();
     var rec = state.rec;
+    if (state.sumStage) {
+      $('#pl-stage-panel').innerHTML = renderStageSummary(state.sumStage);
+      var back = $('#pl-sum-back');
+      if (back) back.addEventListener('click', function () { state.sumStage = ''; renderStagePanel(); });
+      return;
+    }
     var stage = stageOfRec(rec);
     var entry = entryOf(rec, stage) || {};
     var status = entry.status || 'empty';
@@ -288,6 +437,55 @@
     else html = panelPublish(rec, entry, status);
     $('#pl-stage-panel').innerHTML = html;
     bindPanel(stage, status);
+  }
+
+  /* ---- 已完成阶段只读摘要（点击时间轴已确认节点） ---- */
+  function renderStageSummary(stage) {
+    var rec = state.rec;
+    var entry = entryOf(rec, stage) || {};
+    var c = entry.content || {};
+    var rows = '';
+    function row(k, v) { rows += '<dt>' + esc(k) + '</dt><dd>' + v + '</dd>'; }
+    if (stage === 'outline') {
+      row('Logline（英文）', esc(c.logline || '—'));
+      row('Logline（中文）', esc(c.loglineZh || '—'));
+      row('题材标签', esc((c.genreTags || []).join('、') || '—'));
+      var mc = c.mainChars || [];
+      row('主要人物', mc.length + ' 位' + (mc.length ? '：' + esc(mc.map(function (m) { return m.nameZh || m.name || '?'; }).join('、')) : ''));
+      row('五幕主线', ((c.fiveActs || []).length) + ' 幕');
+    } else if (stage === 'synopsis') {
+      var eps = c.episodes || [];
+      var pays = eps.filter(function (e) { return e.paymark; }).length;
+      row('分集梗概', eps.length + ' / ' + (rec.episodes || '?') + ' 集');
+      row('付费卡点', pays + ' 处');
+      var ol = entryOf(rec, 'outline');
+      var acts = (ol && ol.content && ol.content.fiveActs) || [];
+      row('幕划分', acts.length ? esc(acts.map(function (a) { return a.title + '（' + (a.epRange || '') + '）'; }).join(' / ')) : '—');
+    } else if (stage === 'script') {
+      var seps = c.episodes || [];
+      var edited = seps.filter(function (e) { return e.edited; }).length;
+      var scenes = 0, lines = 0;
+      seps.forEach(function (e) { (e.scenes || []).forEach(function (sc) { scenes++; lines += (sc.lines || []).length; }); });
+      row('已生成', seps.length + ' / ' + (rec.episodes || '?') + ' 集');
+      row('已人工编辑', edited + ' 集');
+      row('场景总数', scenes + ' 个');
+      row('对白行总数', lines + ' 行');
+    } else if (stage === 'assets') {
+      if (entry.status === 'skipped') row('视觉资产', '已跳过生图');
+      else {
+        var items = c.items || [];
+        row('图片数量', items.length + ' 张');
+        row('图片清单', items.length ? esc(items.map(function (it) { return it.label || it.key; }).join('、')) : '—');
+      }
+    } else {
+      row('飞书文档', c.feishuDocUrl ? '<a class="pl-link" target="_blank" rel="noopener" href="' + esc(c.feishuDocUrl) + '">打开文档 →</a>' : '—');
+      row('线上页面', c.pageUrl ? '<a class="pl-link" target="_blank" rel="noopener" href="' + esc(c.pageUrl) + '">打开页面 →</a>' : '—');
+      row('发布时间', c.deployedAt ? esc(fmtTime(c.deployedAt)) : '—');
+    }
+    row('更新时间', entry.updatedAt ? esc(fmtTime(entry.updatedAt)) : '—');
+    return '<h3 class="pl-stage-title">' + (STAGE_ICONS[stage] || '') + '「' + esc(STAGE_LABELS[stage]) + '」阶段摘要' + stBadge(entry.status || 'approved') + '</h3>' +
+      '<div class="pl-sum-card"><dl>' + rows + '</dl></div>' +
+      '<div class="pl-confirm"><button type="button" class="pl-btn pl-btn-ghost" id="pl-sum-back">← 返回当前阶段</button></div>';
   }
 
   /* ---- 阶段 1：大纲（可编辑表单） ---- */
@@ -460,10 +658,11 @@
       grid += '<button type="button" class="' + cls + '" data-ep="' + i + '">' + i + (e && e.edited ? '<i>改</i>' : '') + '</button>';
     }
     var editedCount = eps.filter(function (x) { return x.edited; }).length;
+    var genPct = Math.round(eps.length / total * 100);
     return '<h3 class="pl-stage-title">阶段 3/5 · 完整剧本' + stBadge(status) + '</h3>' +
       (status === 'rejected' ? legacyRejectedNote() : '') +
-      '<p class="pl-muted">已生成 ' + eps.length + ' / ' + total + ' 集' + (editedCount ? ' · 已编辑 ' + editedCount + ' 集' : '') +
-      '。点击左侧集数查看与编辑，编辑后记得点「保存本集」。</p>' +
+      '<div class="pl-script-stat"><div class="pl-subbar"><i style="width:' + genPct + '%"></i></div>' +
+      '<span class="pl-muted">生成 ' + eps.length + '/' + total + ' 集（' + genPct + '%）· 已人工编辑 ' + editedCount + ' 集。点击左侧集数查看与编辑，编辑后记得点「保存本集」。</span></div>' +
       '<div class="pl-script-layout">' +
       '<div class="pl-ep-grid">' + grid + '</div>' +
       '<div class="pl-ep-editor" id="pl-ep-editor"></div>' +
@@ -737,6 +936,44 @@
 
   /* ---------- 面板事件绑定 ---------- */
 
+  /* 等待态可视化：已等待时长每秒跳动 + 剧本生成进度条 + 15 秒自动轮询（含倒计时，有未保存编辑时暂停） */
+  function startWaitViz(stage) {
+    var rec = state.rec;
+    var entry = entryOf(rec, stage) || {};
+    var since = entry.updatedAt || rec.updatedAt || rec.createdAt;
+    var elapsedEl = $('#pl-elapsed');
+    var barEl = $('#pl-wait-bar');
+    var tipEl = $('#pl-poll-tip');
+
+    var p = entry.progress;
+    if (barEl && p && Number(p.total) > 0) {
+      barEl.hidden = false;
+      var bar = $('i', barEl);
+      if (bar) bar.style.width = Math.min(100, Math.round(Number(p.written) / Number(p.total) * 100)) + '%';
+    }
+
+    function tickElapsed() {
+      if (elapsedEl) elapsedEl.textContent = '⏱ 已等待 ' + elapsedText(since);
+    }
+    if (elapsedEl) { elapsedEl.hidden = false; tickElapsed(); }
+    state.waitTimer = setInterval(tickElapsed, 1000);
+
+    var left = POLL_SECS;
+    function tip() {
+      if (!tipEl) return;
+      tipEl.textContent = state.dirty
+        ? '检测到未保存的编辑，自动刷新已暂停'
+        : '每 ' + POLL_SECS + ' 秒自动刷新，' + left + ' 秒后检查最新进度（也可点上方「刷新状态」）';
+    }
+    if (tipEl) { tipEl.hidden = false; tip(); }
+    state.pollTimer = setInterval(function () {
+      if (state.dirty) { left = POLL_SECS; tip(); return; }
+      left--;
+      if (left <= 0) { loadDetail(state.rec.id); return; }
+      tip();
+    }, 1000);
+  }
+
   function bindPanel(stage, status) {
     var waitReload = $('#pl-wait-reload');
     if (waitReload) waitReload.addEventListener('click', function () { loadDetail(state.rec.id); });
@@ -754,6 +991,8 @@
       }
       loadAssetImages();
     }
+
+    if ($('#pl-elapsed')) startWaitViz(stage);
   }
 
   /* ---------- init ---------- */

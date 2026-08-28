@@ -106,9 +106,10 @@ async function onRequestPost(context) {
   if (EPISODES.indexOf(episodes) < 0) return json({ ok: false, error: 'BAD_EPISODES', message: '集数体量不合法（60 / 72 / 80）' }, 400);
 
   const editKey = genEditKey();
+  const now = new Date().toISOString();
   const rec = {
     id: genId(),
-    createdAt: new Date().toISOString(),
+    createdAt: now,
     status: 'received',
     statusNote: '',
     stage: 'outline',
@@ -120,6 +121,7 @@ async function onRequestPost(context) {
     benchmark: clean(body.benchmark, 200),
     contact: clean(body.contact, 200),
     editKeyHash: await sha256Hex(editKey),
+    events: [{ t: now, type: 'submitted', stage: '', label: '创意提交，进入管线' }],
   };
   await store.put(PREFIX + rec.id, JSON.stringify(rec));
 

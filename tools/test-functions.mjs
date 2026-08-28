@@ -327,6 +327,57 @@ check('旧版 PATCH {status} 依然可用', r.status === 200 && (await r.json())
 r = await idMod.onRequest({ request: new Request(BASE + '/' + OLD_ID, { headers: { 'X-Edit-Key': 'whatever12345678' } }), env, params: { id: OLD_ID } });
 check('旧记录无 editKeyHash → 密钥鉴权 401', r.status === 401);
 
+console.log('⑮ v1.6：进度事件流 + stageStatuses');
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'Events Test' }), env, waitUntil });
+const IDV = (await r.json()).id;
+r = await idMod.onRequest({ request: get(IDV, 'test-admin-token'), env, params: { id: IDV } });
+j = await r.json();
+check('新提交初始化事件流 submitted', r.status === 200 && j.submission.events && j.submission.events.length === 1 && j.submission.events[0].type === 'submitted');
+r = await idMod.onRequest({ request: get(IDV, null), env, params: { id: IDV } });
+j = await r.json();
+check('公开查询含 stageStatuses（全部阶段状态码）', j.stageStatuses && j.stageStatuses.outline === 'empty' && j.stageStatuses.script === 'empty' && j.stageStatuses.done === 'empty');
+check('公开查询不含事件流与内容', !j.events && !j.stages);
+await P(IDV, { action: 'request-generate', stage: 'outline' });
+await P(IDV, { action: 'stage-content', stage: 'outline', content: { logline: 'x' } });
+await P(IDV, { action: 'decision', stage: 'outline', decision: 'approved' });
+r = await idMod.onRequest({ request: get(IDV, 'test-admin-token'), env, params: { id: IDV } });
+j = await r.json();
+const evs = j.submission.events;
+check('事件流按序记录 request → ready → approved', evs.length === 4 && evs[1].type === 'request' && evs[2].type === 'ready' && evs[3].type === 'approved');
+check('approved 事件标注推进目标', evs[3].label.indexOf('分集梗概') >= 0);
+r = await idMod.onRequest({ request: get(IDV, null), env, params: { id: IDV } });
+j = await r.json();
+check('公开 stageStatuses 反映阶段推进（outline=approved）', j.stageStatuses.outline === 'approved' && j.stageStatuses.synopsis === 'empty');
+
+r = await idMod.onRequest({ request: get(ID2, null), env, params: { id: ID2 } });
+j = await r.json();
+check('完成记录公开 stageStatuses（publish=done / assets=skipped）', j.stageStatuses.publish === 'done' && j.stageStatuses.assets === 'skipped' && j.stageStatuses.outline === 'approved');
+r = await idMod.onRequest({ request: get(ID3, 'test-admin-token'), env, params: { id: ID3 } });
+j = await r.json();
+const t3 = j.submission.events.map((e) => e.type);
+check('资产生成路径事件齐全（choice/asset/published）', t3.includes('assets-choice') && t3.includes('asset') && t3.includes('published'));
+r = await idMod.onRequest({ request: get(ID2, 'test-admin-token'), env, params: { id: ID2 } });
+j = await r.json();
+const t2 = j.submission.events.map((e) => e.type);
+check('剧本路径含 progress 与 rejected 事件', t2.includes('progress') && t2.includes('rejected'));
+
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'Event Cap Test' }), env, waitUntil });
+const IDC = (await r.json()).id;
+await P(IDC, { action: 'stage-content', stage: 'outline', content: { logline: 'x' } });
+await P(IDC, { action: 'decision', stage: 'outline', decision: 'approved' });
+await P(IDC, { action: 'stage-content', stage: 'synopsis', content: { episodes: [{ ep: 1, title: 'T', hook: 'H', beat: 'B', paymark: '' }] } });
+await P(IDC, { action: 'decision', stage: 'synopsis', decision: 'approved' });
+for (let i = 0; i < 62; i++) await P(IDC, { action: 'stage-content', stage: 'script', ready: false, content: { episodes: [{ ep: (i % 4) + 1, title: 'T' + i, hook: 'H', scenes: [] }] } });
+r = await idMod.onRequest({ request: get(IDC, 'test-admin-token'), env, params: { id: IDC } });
+j = await r.json();
+check('事件流上限 60 条（超出截断）', j.submission.events.length === 60);
+check('截断保留最新 progress 事件', j.submission.events[j.submission.events.length - 1].type === 'progress');
+check('超出后最早的 submitted 事件被裁剪', !j.submission.events.some((e) => e.type === 'submitted'));
+
+r = await idMod.onRequest({ request: get(OLD_ID, 'test-admin-token'), env, params: { id: OLD_ID } });
+j = await r.json();
+check('旧记录动作后事件流自动创建（status）', j.submission.events && j.submission.events.length === 1 && j.submission.events[0].type === 'status');
+
 console.log('⑭ 其他方法与 KV 未绑定');
 r = await indexMod.onRequest({ request: new Request(BASE, { method: 'DELETE' }), env });
 check('DELETE /api/submissions → 405', r.status === 405);
