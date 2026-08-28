@@ -475,10 +475,10 @@ async function notifyStage(env, n) {
   const lines = ['剧名：**《' + n.title + '》**', '编号：`' + n.id + '`'];
 
   if (n.type === 'ready') {
-    title = '📝 「' + n.stageLabel + '」已生成，待确认';
-    lines.push('请前往审核工作台确认：' + link);
+    title = '📝 「' + n.stageLabel + '」已生成，可编辑确认';
+    lines.push('请前往编辑工作台编辑并确认：' + link);
   } else if (n.type === 'decision' && n.decision === 'approved') {
-    title = '✅ 「' + n.stageLabel + '」已通过';
+    title = '✅ 「' + n.stageLabel + '」已确认';
     lines.push('进入「' + n.nextLabel + '」阶段');
     lines.push(link);
   } else if (n.type === 'decision') {

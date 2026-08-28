@@ -1,4 +1,4 @@
-/* 剧本工坊 · 管线审核工作台：列表 / 阶段确认 / 剧本模块化编辑 / 资产审阅 */
+/* 剧本工坊 · 管线编辑工作台：AI 生成 → 在线编辑修改 → 确认后自动进入下一阶段 */
 (function () {
   'use strict';
   var $ = function (s, el) { return (el || document).querySelector(s); };
@@ -8,7 +8,7 @@
   var STAGE_LABELS = { outline: '大纲', synopsis: '分集梗概', script: '完整剧本', assets: '视觉资产', publish: '发布上线', done: '已完成' };
   var STAGE_FLOW = ['outline', 'synopsis', 'script', 'assets', 'publish', 'done'];
   var STAGE_STATUS_LABELS = {
-    empty: '未开始', draft: '生成中', pending_review: '待确认', approved: '已通过', rejected: '已驳回',
+    empty: '未开始', draft: '生成中', pending_review: '待编辑确认', approved: '已确认', rejected: '已驳回（旧）',
     awaiting_choice: '待选择', generating: '生成中', skipped: '已跳过', pending: '待发布', done: '已完成',
   };
   var PAIRINGS = { bg: 'BG 男女', bl: 'BL 男男', gl: 'GL 女女' };
@@ -17,7 +17,7 @@
     rebirth: '重生复仇', 'hidden-identity': '隐藏身份', contract: '契约婚姻',
   };
 
-  var state = { token: '', list: [], rec: null, curEp: 0, note: '' };
+  var state = { token: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false };
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -97,7 +97,7 @@
     var box = $('#pl-list');
     $('#pl-count').textContent = state.list.length + ' 条提交';
     if (!state.list.length) {
-      box.innerHTML = '<p class="pl-muted">暂无提交。用户在「撰写新剧本」页提交后，创意将出现在这里，随后进入五阶段确认管线。</p>';
+      box.innerHTML = '<p class="pl-muted">暂无提交。用户在「撰写新剧本」页提交后，创意将出现在这里，随后进入五阶段创作管线。</p>';
       return;
     }
     var rows = state.list.map(function (r) {
@@ -132,6 +132,8 @@
     $('#pl-stage-panel').innerHTML = '<p class="pl-muted">加载中…</p>';
     api('GET', '/api/submissions/' + encodeURIComponent(id)).then(function (j) {
       state.rec = j.submission;
+      state.dirty = false;
+      state.epDirty = false;
       renderDetail();
     }).catch(function (ex) {
       $('#pl-stage-panel').innerHTML = '<p class="pl-err">加载失败：' + esc(ex.message) + '</p>';
@@ -182,25 +184,15 @@
       '<button type="button" class="pl-btn pl-btn-ghost" id="pl-wait-reload">刷新状态</button></div>';
   }
 
-  function rejectedHtml(label, entry) {
-    return '<div class="pl-rejected"><h3>「' + esc(label) + '」已驳回</h3>' +
-      '<p class="pl-rejected-feedback">' + esc(entry && entry.feedback || '（无反馈内容）') + '</p>' +
-      '<p class="pl-muted">等待 AI 根据反馈重新生成，完成后将再次送审。' +
-      (label === '完整剧本' ? '期间你仍可在线编辑已生成的剧集。' : '') + '</p></div>';
+  function legacyRejectedNote() {
+    return '<p class="pl-muted" style="margin:0 0 14px">该阶段在旧审核流程中曾被驳回，现可直接编辑修改后确认推进。</p>';
   }
 
-  function rejectedNote(entry) {
-    return '<div class="pl-rejected-note">上一轮驳回反馈：' + esc(entry && entry.feedback || '') + '</div>';
-  }
-
-  function decisionBar() {
-    return '<div class="pl-decision">' +
-      '<textarea id="pl-decision-note" rows="3" placeholder="驳回时必填反馈意见；通过时可留空">' + esc(state.note || '') + '</textarea>' +
-      '<div class="pl-decision-btns">' +
-      '<button type="button" class="pl-btn pl-btn-ok" id="pl-approve">✓ 通过本阶段</button>' +
-      '<button type="button" class="pl-btn pl-btn-reject" id="pl-reject">✗ 驳回</button>' +
-      '</div>' +
-      '<p class="pl-muted">通过后进入下一阶段；驳回需填写反馈，AI 将重新生成本阶段内容。</p>' +
+  function confirmBar(withSave, hint) {
+    return '<div class="pl-confirm">' +
+      (withSave ? '<button type="button" class="pl-btn pl-btn-ghost" id="pl-save">保存修改</button>' : '') +
+      '<button type="button" class="pl-btn pl-btn-ok" id="pl-confirm">✓ 确认无误，进入下一阶段</button>' +
+      (hint ? '<span class="pl-confirm-hint">' + esc(hint) + '</span>' : '') +
       '</div>';
   }
 
@@ -219,54 +211,131 @@
     bindPanel(stage, status);
   }
 
-  /* ---- 阶段 1：大纲 ---- */
+  /* ---- 阶段 1：大纲（可编辑表单） ---- */
   function panelOutline(rec, entry, status) {
     if (status === 'empty' || status === 'draft' || status === 'generating')
-      return waitHtml('大纲生成中…', 'AI 正在撰写剧本大纲（世界观 / 人物 / 五幕主线 / 付费卡点策略）。');
-    if (status === 'rejected') return rejectedHtml('大纲', entry);
+      return waitHtml('大纲生成中…', 'AI 正在撰写剧本大纲（世界观 / 人物 / 五幕主线 / 付费卡点策略），完成后可在此直接编辑。');
     var c = (entry && entry.content) || {};
-    var chars = (c.mainChars || []).map(function (m) {
-      return '<tr><td><b>' + esc(m.name) + '</b>' + (m.nameZh ? '<br><span class="pl-muted">' + esc(m.nameZh) + '</span>' : '') + '</td>' +
-        '<td>' + esc(m.role || '') + '</td><td>' + esc(m.arc || '') + '</td></tr>';
-    }).join('');
-    var acts = (c.fiveActs || []).map(function (a) {
-      return '<div class="pl-act"><div class="pl-act-head"><b>' + esc(a.title || '') + '</b><span class="pl-muted">' + esc(a.epRange || '') + '</span></div>' +
-        '<p>' + esc(a.summary || '') + '</p></div>';
-    }).join('');
-    var tags = (c.genreTags || []).map(function (t) { return '<span class="pl-chip">' + esc(t) + '</span>'; }).join('');
-    function blk(k, v) { return v ? '<div class="pl-block"><div class="pl-k">' + esc(k) + '</div><p>' + esc(v) + '</p></div>' : ''; }
+    var charRows = (c.mainChars || []).map(function (m) { return charRowTpl(m); }).join('');
+    var actCards = (c.fiveActs || []).map(function (a) { return actCardTpl(a); }).join('');
+    function fld(label, id, val, rows) {
+      return '<div class="pl-field"><label>' + esc(label) + '</label>' +
+        '<textarea id="' + id + '" class="pl-ta" rows="' + (rows || 3) + '">' + esc(val || '') + '</textarea></div>';
+    }
     return '<h3 class="pl-stage-title">阶段 1/5 · 剧本大纲' + stBadge(status) + '</h3>' +
-      blk('Logline（英文）', c.logline) + blk('Logline（中文）', c.loglineZh) +
-      (tags ? '<div class="pl-block"><div class="pl-k">题材标签</div>' + tags + '</div>' : '') +
-      blk('世界观设定', c.setting) + blk('主题与情绪', c.themes) + blk('CP 动力学', c.cpDynamics) + blk('付费卡点策略', c.paywallStrategy) +
-      (chars ? '<div class="pl-block"><div class="pl-k">主要人物</div><div class="pl-table-wrap"><table class="pl-table"><thead><tr><th>人物</th><th>定位</th><th>人物弧光</th></tr></thead><tbody>' + chars + '</tbody></table></div></div>' : '') +
-      (acts ? '<div class="pl-block"><div class="pl-k">五幕主线</div>' + acts + '</div>' : '') +
-      decisionBar();
+      (status === 'rejected' ? legacyRejectedNote() : '') +
+      '<p class="pl-muted" style="margin:0 0 16px">AI 已生成大纲初稿，所有字段均可直接修改。</p>' +
+      fld('Logline（英文）', 'ol-logline', c.logline, 3) +
+      fld('Logline（中文）', 'ol-loglineZh', c.loglineZh, 3) +
+      '<div class="pl-field"><label>题材标签（逗号分隔）</label>' +
+      '<input id="ol-tags" class="pl-in" value="' + esc((c.genreTags || []).join(', ')) + '" placeholder="如：亿万总裁, 野性攻, 命定占有"></div>' +
+      fld('世界观设定', 'ol-setting', c.setting, 4) +
+      fld('主题与情绪', 'ol-themes', c.themes, 3) +
+      fld('CP 动力学', 'ol-cpDynamics', c.cpDynamics, 4) +
+      fld('付费卡点策略', 'ol-paywallStrategy', c.paywallStrategy, 4) +
+      '<div class="pl-field"><label>主要人物</label>' +
+      '<div class="pl-table-wrap"><table class="pl-table"><thead><tr><th style="width:16%">人物（英）</th><th style="width:14%">人物（中）</th><th style="width:22%">定位</th><th>人物弧光</th><th style="width:34px"></th></tr></thead>' +
+      '<tbody id="pl-char-tbody">' + (charRows || '') + '</tbody></table></div>' +
+      '<button type="button" class="pl-mini ol-add-char" style="margin-top:8px">+ 添加人物</button></div>' +
+      '<div class="pl-field"><label>五幕主线</label>' +
+      '<div id="pl-acts">' + (actCards || '<p class="pl-muted">暂无幕，点击下方添加。</p>') + '</div>' +
+      '<button type="button" class="pl-mini ol-add-act">+ 添加幕</button></div>' +
+      confirmBar(true, '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
   }
 
-  /* ---- 阶段 2：分集梗概 ---- */
+  function charRowTpl(m) {
+    m = m || {};
+    return '<tr class="ol-char-row">' +
+      '<td><input class="pl-in ol-name" value="' + esc(m.name || '') + '" placeholder="Name"></td>' +
+      '<td><input class="pl-in ol-namezh" value="' + esc(m.nameZh || '') + '" placeholder="中文名"></td>' +
+      '<td><input class="pl-in ol-role" value="' + esc(m.role || '') + '" placeholder="攻/受·定位·年龄"></td>' +
+      '<td><textarea class="pl-ta ol-arc" rows="2">' + esc(m.arc || '') + '</textarea></td>' +
+      '<td><button type="button" class="pl-mini ol-del-char" title="删除此行">×</button></td>' +
+      '</tr>';
+  }
+
+  function actCardTpl(a) {
+    a = a || {};
+    return '<div class="pl-act ol-act">' +
+      '<div class="pl-act-head">' +
+      '<input class="pl-in ol-act-title" style="flex:1;min-width:160px" value="' + esc(a.title || '') + '" placeholder="幕标题，如 第一幕 · The Claim">' +
+      '<input class="pl-in ol-act-range" style="width:130px" value="' + esc(a.epRange || '') + '" placeholder="EP01-12">' +
+      '<button type="button" class="pl-mini ol-del-act" title="删除此幕">×</button>' +
+      '</div>' +
+      '<textarea class="pl-ta ol-act-summary" rows="3" placeholder="本幕剧情概要">' + esc(a.summary || '') + '</textarea>' +
+      '</div>';
+  }
+
+  function collectOutline() {
+    var chars = $$('#pl-stage-panel .ol-char-row').map(function (tr) {
+      return {
+        name: ($('.ol-name', tr) || {}).value || '',
+        nameZh: ($('.ol-namezh', tr) || {}).value || '',
+        role: ($('.ol-role', tr) || {}).value || '',
+        arc: ($('.ol-arc', tr) || {}).value || '',
+      };
+    });
+    var acts = $$('#pl-stage-panel .ol-act').map(function (d, i) {
+      return {
+        act: i + 1,
+        title: ($('.ol-act-title', d) || {}).value || '',
+        epRange: ($('.ol-act-range', d) || {}).value || '',
+        summary: ($('.ol-act-summary', d) || {}).value || '',
+      };
+    });
+    var tags = (($('#ol-tags') || {}).value || '').split(/[,，、]/).map(function (s) { return s.trim(); }).filter(Boolean);
+    return {
+      logline: (($('#ol-logline') || {}).value || '').trim(),
+      loglineZh: (($('#ol-loglineZh') || {}).value || '').trim(),
+      genreTags: tags,
+      setting: (($('#ol-setting') || {}).value || '').trim(),
+      themes: (($('#ol-themes') || {}).value || '').trim(),
+      cpDynamics: (($('#ol-cpDynamics') || {}).value || '').trim(),
+      paywallStrategy: (($('#ol-paywallStrategy') || {}).value || '').trim(),
+      mainChars: chars,
+      fiveActs: acts,
+    };
+  }
+
+  /* ---- 阶段 2：分集梗概（可编辑表格） ---- */
   function panelSynopsis(rec, entry, status) {
     if (status === 'empty' || status === 'draft')
-      return waitHtml('分集梗概生成中…', '大纲已通过，AI 正在撰写全 ' + (rec.episodes || '?') + ' 集分集梗概与钩子。');
-    if (status === 'rejected') return rejectedHtml('分集梗概', entry);
+      return waitHtml('分集梗概生成中…', '大纲已确认，AI 正在撰写全 ' + (rec.episodes || '?') + ' 集分集梗概与钩子，完成后可在此直接编辑。');
     var eps = (entry.content && entry.content.episodes) || [];
     if (!eps.length) return waitHtml('分集梗概生成中…', '尚未写入内容。');
     var ol = entryOf(rec, 'outline');
     var acts = (ol && ol.content && ol.content.fiveActs) || [];
     var rows = eps.map(function (e) {
-      var pm = e.paymark ? '<span class="pl-paymark">' + esc(e.paymark) + '</span>' : '';
-      return '<tr><td class="pl-mono">EP' + String(e.ep).padStart(2, '0') + '</td>' +
-        '<td><b>' + esc(e.title) + '</b></td><td>' + esc(e.hook || '') + '</td>' +
-        '<td class="pl-muted">' + esc(e.beat || '') + '</td><td>' + pm + '</td></tr>';
+      return '<tr class="sy-row" data-ep="' + esc(e.ep) + '">' +
+        '<td class="pl-mono">EP' + String(e.ep).padStart(2, '0') + '</td>' +
+        '<td><input class="pl-in sy-title" value="' + esc(e.title || '') + '" placeholder="标题"></td>' +
+        '<td><input class="pl-in sy-hook" value="' + esc(e.hook || '') + '" placeholder="结尾钩子"></td>' +
+        '<td><input class="pl-in sy-beat" value="' + esc(e.beat || '') + '" placeholder="剧情节拍"></td>' +
+        '<td><input class="pl-in sy-paymark" value="' + esc(e.paymark || '') + '" placeholder="付费卡点标记"></td>' +
+        '</tr>';
     }).join('');
     var groupNote = acts.length
       ? '<p class="pl-muted">幕划分：' + acts.map(function (a) { return esc(a.title) + '（' + esc(a.epRange || '') + '）'; }).join(' / ') + '</p>'
       : '';
     return '<h3 class="pl-stage-title">阶段 2/5 · 分集梗概' + stBadge(status) + '</h3>' +
-      '<p class="pl-muted">共 ' + eps.length + ' / ' + (rec.episodes || '?') + ' 集' + (eps.length < Number(rec.episodes) ? '（尚未写完）' : '') + '</p>' +
+      (status === 'rejected' ? legacyRejectedNote() : '') +
+      '<p class="pl-muted">共 ' + eps.length + ' / ' + (rec.episodes || '?') + ' 集' + (eps.length < Number(rec.episodes) ? '（尚未写完）' : '') + '，每集的标题 / 钩子 / 节拍 / 付费标记均可直接修改。</p>' +
       groupNote +
-      '<div class="pl-block"><div class="pl-table-wrap pl-ep-scroll"><table class="pl-table"><thead><tr><th>集</th><th>标题</th><th>钩子</th><th>剧情节拍</th><th>标记</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
-      decisionBar();
+      '<div class="pl-block"><div class="pl-table-wrap pl-ep-scroll"><table class="pl-table"><thead><tr><th>集</th><th style="width:18%">标题</th><th style="width:26%">钩子</th><th style="width:28%">剧情节拍</th><th style="width:14%">付费标记</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
+      confirmBar(true, '修改后可先「保存修改」暂存；直接点确认也会自动保存再推进。');
+  }
+
+  function collectSynopsis() {
+    var eps = $$('#pl-stage-panel .sy-row').map(function (tr) {
+      return {
+        ep: Number(tr.getAttribute('data-ep')),
+        title: ($('.sy-title', tr) || {}).value || '',
+        hook: ($('.sy-hook', tr) || {}).value || '',
+        beat: ($('.sy-beat', tr) || {}).value || '',
+        paymark: ($('.sy-paymark', tr) || {}).value || '',
+      };
+    });
+    return { episodes: eps };
   }
 
   /* ---- 阶段 3：完整剧本（模块化编辑器） ---- */
@@ -274,13 +343,11 @@
     if (status === 'empty' || status === 'draft') {
       var p = entry && entry.progress;
       return waitHtml('完整剧本生成中…',
-        (p ? '已生成 ' + p.written + ' / ' + p.total + ' 集。' : '分集梗概已通过，AI 正在分批撰写全集完整剧本。') +
-        '生成完成后可逐集审阅与在线编辑。');
+        (p ? '已生成 ' + p.written + ' / ' + p.total + ' 集。' : '分集梗概已确认，AI 正在分批撰写全集完整剧本。') +
+        '生成完成后可逐集在线编辑。');
     }
     var eps = (entry.content && entry.content.episodes) || [];
-    if (!eps.length) {
-      return status === 'rejected' ? rejectedHtml('完整剧本', entry) : waitHtml('完整剧本生成中…', '内容尚未写入。');
-    }
+    if (!eps.length) return waitHtml('完整剧本生成中…', '内容尚未写入。');
     var total = Number(rec.episodes) || 72;
     if (!state.curEp || !eps.some(function (e) { return e.ep === state.curEp; })) state.curEp = eps[0].ep;
     var grid = '';
@@ -292,14 +359,14 @@
     }
     var editedCount = eps.filter(function (x) { return x.edited; }).length;
     return '<h3 class="pl-stage-title">阶段 3/5 · 完整剧本' + stBadge(status) + '</h3>' +
-      '<p class="pl-muted">已生成 ' + eps.length + ' / ' + total + ' 集' + (editedCount ? ' · 你已编辑 ' + editedCount + ' 集' : '') +
+      (status === 'rejected' ? legacyRejectedNote() : '') +
+      '<p class="pl-muted">已生成 ' + eps.length + ' / ' + total + ' 集' + (editedCount ? ' · 已编辑 ' + editedCount + ' 集' : '') +
       '。点击左侧集数查看与编辑，编辑后记得点「保存本集」。</p>' +
-      (status === 'rejected' ? rejectedNote(entry) : '') +
       '<div class="pl-script-layout">' +
       '<div class="pl-ep-grid">' + grid + '</div>' +
       '<div class="pl-ep-editor" id="pl-ep-editor"></div>' +
       '</div>' +
-      decisionBar();
+      confirmBar(false, '逐集编辑并「保存本集」后，点确认按钮进入视觉资产阶段。');
   }
 
   function renderEpEditor() {
@@ -310,6 +377,7 @@
     for (var i = 0; i < eps.length; i++) if (eps[i].ep === state.curEp) { ep = eps[i]; break; }
     var box = $('#pl-ep-editor');
     if (!box) return;
+    state.epDirty = false;
     if (!ep) { box.innerHTML = '<p class="pl-muted">第 ' + state.curEp + ' 集尚未生成。</p>'; return; }
     var scenesHtml = (ep.scenes || []).map(function (sc, si) {
       var lines = (sc.lines || []).map(function (l, li) {
@@ -366,6 +434,7 @@
 
     $$('.pl-ep-btn').forEach(function (b) {
       b.addEventListener('click', function () {
+        if (state.epDirty && !confirm('当前剧集有未保存的修改，继续切换将丢失，确定？')) return;
         state.curEp = Number(b.getAttribute('data-ep'));
         renderStagePanel();
       });
@@ -377,16 +446,20 @@
       if (t.classList.contains('add-scene')) {
         var cont = $('.pl-scenes', box);
         if (cont) cont.insertAdjacentHTML('beforeend', sceneTpl());
+        state.epDirty = true;
       } else if (t.classList.contains('del-scene')) {
         var sc = t.closest('.pl-scene');
         if (sc) sc.remove();
+        state.epDirty = true;
       } else if (t.classList.contains('add-line')) {
         var sc2 = t.closest('.pl-scene');
         var lines = sc2 ? $('.pl-lines', sc2) : null;
         if (lines) lines.insertAdjacentHTML('beforeend', lineTpl());
+        state.epDirty = true;
       } else if (t.classList.contains('del-line')) {
         var row = t.closest('.pl-line-row');
         if (row) row.remove();
+        state.epDirty = true;
       } else if (t.id === 'pl-save-ep') {
         saveCurrentEp(t);
       }
@@ -433,6 +506,7 @@
       var idx = -1;
       for (var i = 0; i < eps.length; i++) if (eps[i].ep === d.ep) { idx = i; break; }
       if (idx >= 0) eps[idx] = ne; else eps.push(ne);
+      state.epDirty = false;
       renderStagePanel();
     }).catch(function (ex) {
       alert('保存失败：' + ex.message);
@@ -444,10 +518,10 @@
   /* ---- 阶段 4：视觉资产 ---- */
   function panelAssets(rec, entry, status) {
     if (status === 'empty')
-      return waitHtml('等待选择…', '剧本已通过，即将进入视觉资产选择。');
+      return waitHtml('等待选择…', '剧本已确认，即将进入视觉资产选择。');
     if (status === 'awaiting_choice')
       return '<h3 class="pl-stage-title">阶段 4/5 · 视觉资产' + stBadge(status) + '</h3>' +
-        '<p class="pl-muted">选择「生成」将由 AI 产出 Key Art 封面 / 角色设定图 / 场景概念图（需数分钟，完成后自动送审）；' +
+        '<p class="pl-muted">选择「生成」将由 AI 产出 Key Art 封面 / 角色设定图 / 场景概念图（需数分钟，完成后可在此查看确认）；' +
         '选择「跳过生图」则直接进入发布阶段，线上页面将以主题色渐变占位封面、不展示资产区块。</p>' +
         '<div class="pl-choice-btns">' +
         '<button type="button" class="pl-btn pl-btn-ok" id="pl-assets-gen">生成视觉资产</button>' +
@@ -456,15 +530,14 @@
     if (status === 'generating')
       return waitHtml('视觉资产生成中…', '已选择生成，AI 正在产出图片并逐张上传（Key Art / 角色设定 / 场景概念）。');
     var items = (entry.content && entry.content.items) || [];
-    if (status === 'rejected' && !items.length) return rejectedHtml('视觉资产', entry);
     var gal = items.map(function (it) {
       return '<figure class="pl-asset"><img data-imgkey="' + esc(it.key) + '" alt="' + esc(it.label) + '">' +
         '<figcaption>' + esc(it.label) + (it.aspect ? ' · ' + esc(it.aspect) : '') + '</figcaption></figure>';
     }).join('');
     return '<h3 class="pl-stage-title">阶段 4/5 · 视觉资产' + stBadge(status) + '</h3>' +
-      (status === 'rejected' ? rejectedNote(entry) : '') +
+      (status === 'rejected' ? legacyRejectedNote() : '') +
       '<div class="pl-asset-grid">' + (gal || '<p class="pl-muted">暂无图片</p>') + '</div>' +
-      decisionBar();
+      confirmBar(false, '确认图片效果后点确认按钮进入发布阶段。');
   }
 
   function loadAssetImages() {
@@ -498,29 +571,55 @@
       '全部阶段已确认。发布动作：创建飞书文档并归档 → 生成线上详情页并注册剧本库 → 加密上线。完成后此处将显示访问链接。');
   }
 
-  /* ---------- 决策 ---------- */
+  /* ---------- 保存与确认 ---------- */
 
-  function bindDecision(stage) {
-    var note = $('#pl-decision-note');
-    if (note) note.addEventListener('input', function () { state.note = note.value; });
-    var ok = $('#pl-approve');
-    var rj = $('#pl-reject');
-    if (ok) ok.addEventListener('click', function () { decide(stage, 'approved'); });
-    if (rj) rj.addEventListener('click', function () { decide(stage, 'rejected'); });
+  function saveStageEdits(stage, done, btn) {
+    var content = stage === 'outline' ? collectOutline() : collectSynopsis();
+    var st = statusOf(state.rec, stage);
+    if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+    api('PATCH', '/api/submissions/' + state.rec.id, {
+      action: 'stage-content', stage: stage, ready: st === 'rejected', content: content,
+    }).then(function () {
+      state.dirty = false;
+      var entry = entryOf(state.rec, stage);
+      if (entry) {
+        entry.content = content;
+        if (st === 'rejected') entry.status = 'pending_review';
+      }
+      renderStagePanel();
+      if (done) done();
+    }).catch(function (ex) {
+      alert('保存失败：' + ex.message);
+      if (btn) { btn.disabled = false; btn.textContent = '保存修改'; }
+    });
   }
 
-  function decide(stage, decision) {
-    var note = (state.note || '').trim();
-    if (decision === 'rejected' && !note) { alert('驳回时请填写反馈意见'); return; }
-    if (!confirm(decision === 'approved'
-      ? '确认通过「' + STAGE_LABELS[stage] + '」阶段？'
-      : '确认驳回「' + STAGE_LABELS[stage] + '」阶段？')) return;
-    api('PATCH', '/api/submissions/' + state.rec.id, {
-      action: 'decision', stage: stage, decision: decision, note: note,
-    }).then(function () {
-      state.note = '';
-      loadDetail(state.rec.id);
-    }).catch(function (ex) { alert('操作失败：' + ex.message); });
+  function confirmStage(stage) {
+    var st = statusOf(state.rec, stage);
+    if (stage === 'script' && state.epDirty) {
+      alert('当前剧集有未保存的修改，请先点击「保存本集」。');
+      return;
+    }
+    if (!confirm('确认「' + STAGE_LABELS[stage] + '」内容无误？确认后将自动进入下一阶段。')) return;
+    var id = state.rec.id;
+    var proceed = function () {
+      api('PATCH', '/api/submissions/' + id, { action: 'decision', stage: stage, decision: 'approved' })
+        .then(function () {
+          state.dirty = false;
+          state.epDirty = false;
+          loadDetail(id);
+        })
+        .catch(function (ex) { alert('确认失败：' + ex.message); });
+    };
+    if ((stage === 'outline' || stage === 'synopsis') && (state.dirty || st === 'rejected')) {
+      saveStageEdits(stage, proceed);
+    } else if (st === 'rejected') {
+      api('PATCH', '/api/submissions/' + id, { action: 'stage-content', stage: stage, ready: true })
+        .then(proceed)
+        .catch(function (ex) { alert('操作失败：' + ex.message); });
+    } else {
+      proceed();
+    }
   }
 
   /* ---------- 面板事件绑定 ---------- */
@@ -533,7 +632,6 @@
       renderEpEditor();
       bindEpEditor();
     }
-    if (status === 'pending_review') bindDecision(stage);
     if (stage === 'assets') {
       if (status === 'awaiting_choice') {
         var g = $('#pl-assets-gen');
@@ -553,6 +651,35 @@
     $('#pl-back').addEventListener('click', function () {
       history.replaceState(null, '', location.pathname);
       loadList();
+    });
+
+    var panel = $('#pl-stage-panel');
+    panel.addEventListener('input', function () {
+      var st = stageOfRec(state.rec);
+      if (st === 'outline' || st === 'synopsis') state.dirty = true;
+      else if (st === 'script') state.epDirty = true;
+    });
+    panel.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || t.nodeType !== 1) return;
+      var stage = stageOfRec(state.rec);
+      if (t.classList.contains('ol-add-char')) {
+        var tb = $('#pl-char-tbody');
+        if (tb) { tb.insertAdjacentHTML('beforeend', charRowTpl({})); state.dirty = true; }
+      } else if (t.classList.contains('ol-del-char')) {
+        var tr = t.closest('tr');
+        if (tr) { tr.remove(); state.dirty = true; }
+      } else if (t.classList.contains('ol-add-act')) {
+        var ac = $('#pl-acts');
+        if (ac) { ac.insertAdjacentHTML('beforeend', actCardTpl({})); state.dirty = true; }
+      } else if (t.classList.contains('ol-del-act')) {
+        var d = t.closest('.ol-act');
+        if (d) { d.remove(); state.dirty = true; }
+      } else if (t.id === 'pl-save') {
+        if (stage === 'outline' || stage === 'synopsis') saveStageEdits(stage, null, t);
+      } else if (t.id === 'pl-confirm') {
+        confirmStage(stage);
+      }
     });
   }
 
