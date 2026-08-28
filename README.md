@@ -17,11 +17,10 @@ scriptroom/
 │   ├── script-<slug>.html         # 剧本详情页（加密包装，十二段结构）
 │   ├── assets/css/、assets/js/    # 明文样式与脚本（设计系统：玫瑰红/月影紫）
 │   └── assets/scripts/<slug>/*.jpg.enc   # 加密图片资产
-├── tools/
-│   ├── crypto.mjs                 # 加解密核心（密码经环境变量/本地文件注入）
-│   ├── cli.mjs                    # 加密 / 解密 / 批量工具
-│   └── template.html              # 加密外壳（门禁 UI + WebCrypto 解密逻辑）
-└── .github/workflows/deploy.yml   # 推送 main 自动部署至 EdgeOne Pages
+└── tools/
+    ├── crypto.mjs                 # 加解密核心（密码经环境变量/本地文件注入）
+    ├── cli.mjs                    # 加密 / 解密 / 批量工具
+    └── template.html              # 加密外壳（门禁 UI + WebCrypto 解密逻辑）
 ```
 
 ## 页面加密机制
@@ -66,15 +65,60 @@ node tools/cli.mjs decrypt-img site/assets/scripts/<slug>/x.jpg.enc > /tmp/x.jpg
 
 ## 部署
 
-推送到 `main` 分支即触发 GitHub Actions 自动部署 `site/` 至 EdgeOne Pages（独立项目 `scriptroom`，与主站互不影响）。
+`site/` 是纯静态加密站点，可部署到任何 HTTPS 静态托管。以 EdgeOne Pages 为例（独立项目 `scriptroom`，与主站互不影响），两种方式二选一：
 
-首次使用需配置一次密钥：
+### 方式一：EdgeOne 控制台 Git 集成（推荐，零 CI 依赖）
 
-1. 在 [EdgeOne Pages 控制台](https://edgeone.cloud.tencent.com/pages) 的「API Token」页创建 Token；
-2. 在本仓库 **Settings → Secrets and variables → Actions** 添加名为 `EDGEONE_TOKEN` 的密钥；
-3. 在 **Actions** 页面重新运行 Deploy 工作流。
+1. [EdgeOne Pages 控制台](https://edgeone.cloud.tencent.com/pages) → 创建项目 → 导入 Git 仓库 → 选择本仓库；
+2. 构建配置中输出目录设为 `site/`；
+3. 之后每次推送 `main` 自动部署，不依赖 GitHub Actions。
 
-未配置密钥时工作流会以警告跳过部署（不会报红）。自定义域名（如 `scriptroom.example.com`）在 EdgeOne 控制台的项目设置中绑定，并按提示添加 CNAME 解析。
+### 方式二：GitHub Actions
+
+1. 在仓库网页界面创建文件 `.github/workflows/deploy.yml`，粘贴以下内容：
+
+```yaml
+name: Deploy to EdgeOne Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install EdgeOne CLI
+        run: npm install -g edgeone@latest
+
+      - name: Deploy site/ to EdgeOne Pages (project: scriptroom)
+        env:
+          EDGEONE_TOKEN: ${{ secrets.EDGEONE_TOKEN }}
+        run: |
+          if [ -z "$EDGEONE_TOKEN" ]; then
+            echo "::warning::未配置 EDGEONE_TOKEN 密钥，跳过部署。请在 Settings → Secrets and variables → Actions 添加后重新运行本工作流。"
+            exit 0
+          fi
+          edgeone pages deploy site -n scriptroom -t "$EDGEONE_TOKEN" \
+            || edgeone makers deploy site -n scriptroom -t "$EDGEONE_TOKEN"
+```
+
+2. 在 EdgeOne 控制台「API Token」页创建 Token，添加到仓库 **Settings → Secrets and variables → Actions**（名称 `EDGEONE_TOKEN`）；
+3. 推送 `main` 或手动触发工作流即自动部署。
+
+自定义域名（如 `scriptroom.example.com`）在 EdgeOne 控制台的项目设置中绑定，并按提示添加 CNAME 解析。
 
 ## 新增剧本流程
 
