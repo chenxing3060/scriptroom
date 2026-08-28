@@ -11,3 +11,4 @@ tools/.password
 
 # EdgeOne CLI 本地配置（含项目关联信息）
 .edgeone/
+.github/

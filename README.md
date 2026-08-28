@@ -13,14 +13,19 @@ scriptroom/
 ├── site/                          # 可直接部署的加密站点（本仓库部署此目录）
 │   ├── index.html                 # 首页（AES-256-GCM 加密包装）
 │   ├── scripts.html               # 剧本库（6 大母题 × BG/BL/GL 配向双重筛选）
-│   ├── script-new.html            # 撰写新剧本入口（加密包装）
+│   ├── script-new.html            # 撰写新剧本入口（真实在线提交，加密包装）
 │   ├── script-<slug>.html         # 剧本详情页（加密包装，十二段结构）
 │   ├── assets/css/、assets/js/    # 明文样式与脚本（设计系统：玫瑰红/月影紫）
 │   └── assets/scripts/<slug>/*.jpg.enc   # 加密图片资产
+├── edge-functions/                # EdgeOne Pages 边缘函数（后端 API）
+│   └── api/submissions/
+│       ├── index.js               # POST 提交创意 / GET 管理列表
+│       └── [id].js                # GET 进度查询 / PATCH 审核状态流转
 └── tools/
     ├── crypto.mjs                 # 加解密核心（密码经环境变量/本地文件注入）
     ├── cli.mjs                    # 加密 / 解密 / 批量工具
-    └── template.html              # 加密外壳（门禁 UI + WebCrypto 解密逻辑）
+    ├── template.html              # 加密外壳（门禁 UI + WebCrypto 解密逻辑）
+    └── test-functions.mjs         # 边缘函数本地测试（模拟运行时 + 内存 KV）
 ```
 
 ## 页面加密机制
@@ -36,6 +41,39 @@ scriptroom/
 - 密码本身不出现在任何仓库文件中（`KEY_HEX` 是单向哈希，无法反推密码）
 - 浏览器解密依赖 WebCrypto，需 HTTPS（或 localhost）访问
 - 密码错误时页面拒绝渲染，密文本身可公开分发
+
+## 在线提交后端（Edge Functions）
+
+「撰写新剧本」表单为真实在线提交：数据持久化到 EdgeOne Pages **KV 存储**，并可推送**飞书群机器人通知**。API 由 `edge-functions/` 目录下的边缘函数提供（与静态站点同域，无 CORS 问题）。
+
+### API
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/api/submissions` | 公开 | 提交创意。字段：`title`*、`idea`*、`pairing`(bg/bl/gl)*、`category`(六母题)*、`episodes`(60/72/80)*、`benchmark`、`contact`。返回 `{ ok, id, status, statusLabel }` |
+| GET | `/api/submissions` | Bearer ADMIN_TOKEN | 管理端查看全部提交（按时间倒序） |
+| GET | `/api/submissions/:id` | 公开（编号不可枚举） | 查询单条进度。管理员带 token 返回完整记录 |
+| PATCH | `/api/submissions/:id` | Bearer ADMIN_TOKEN | 审核流转：`status` ∈ received / reviewing / generating / published / rejected，可附 `note` |
+
+提交编号形如 `SR_20260828_Ab3xK9mQ`（日期 + 8 位随机字符），用户可在表单提交后直接查询进度。
+
+### 控制台一次性配置（部署后）
+
+1. **KV 存储**：控制台左侧「KV 存储」→ 申请开通账户 → 创建命名空间（如 `scriptroom_subs`）→ 进入项目 `scriptroom` → 设置 → KV 存储 → 绑定命名空间，**变量名必须为 `SUBMISSIONS_KV`**；
+2. **环境变量**（项目设置 → 环境变量）：
+   - `ADMIN_TOKEN`（必填，管理端鉴权）：建议 `openssl rand -hex 16` 生成；
+   - `FEISHU_WEBHOOK`（可选）：飞书群自定义机器人的 Webhook 地址，新提交实时推送卡片；
+   - `FEISHU_WEBHOOK_SECRET`（可选）：机器人开启签名校验时的密钥，函数自动计算签名；
+3. 修改配置后**重新部署一次**使环境变量生效。
+
+未完成上述配置时：提交接口返回 503 并提示原因（KV 未绑定 / 未配置 ADMIN_TOKEN），不影响静态站点访问。
+
+### 本地测试
+
+```bash
+node tools/test-functions.mjs   # 模拟边缘运行时 + 内存 KV，26 项断言
+```
+
 
 ## 快速开始
 
@@ -141,9 +179,10 @@ jobs:
 | localStorage | `planvis-lang` / `pv_unlock` | `scriptroom-lang` / `sr_unlock` |
 | 交付物 | 立项决策依据 | 可开机拍摄的剧本包 |
 
-## 当前状态（v1.1 · 2026-08-28）
+## 当前状态（v1.2 · 2026-08-28）
 
 - 4 个加密页面：首页 / 剧本库（母题 × 配向双重筛选）/ 撰写入口 / 《血月新娘》72 集完整剧本
 - 配对取向维度：BG / BL / GL 表单必选 + 筛选直达（`scripts.html?cat=…&pair=…`）
+- **在线提交后端**：边缘函数 API（提交 / 进度查询 / 审核流转）+ KV 持久化 + 飞书通知，26 项本地测试通过
 - 5 张加密视觉资产（9:16 Key Art / 16:9 角色四视图 / 4:3 场景剧情概念图）
 - 页面与图片解密往返均字节级验收通过
