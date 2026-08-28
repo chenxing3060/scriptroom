@@ -387,6 +387,176 @@ r = await indexMod.onRequest({ request: post(valid), env, waitUntil });
 check('KV 未绑定 → 503 KV_UNBOUND', r.status === 503 && (await r.json()).error === 'KV_UNBOUND');
 globalThis.SUBMISSIONS_KV = saved;
 
+/* ================= ⑯ v1.7 真实 AI 生成（mock Moonshot / 速创） ================= */
+
+console.log('⑯ v1.7：drive 真实生成管线（mock Moonshot + 速创）');
+
+const realFetch = globalThis.fetch;
+const envAI = { ...env, KIMI_API_KEY: 'test-kimi-key', SUCHUANG_API_KEY: 'test-img-key' };
+let kimiCalls = 0, imgCalls = 0;
+
+function mockKimi(content) {
+  return new Response(JSON.stringify({ choices: [{ message: { content }, finish_reason: 'stop' }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+function mockJpeg(kb) {
+  const n = (kb || 3) * 1024;
+  const b = new Uint8Array(n);
+  b[0] = 0xff; b[1] = 0xd8; b[n - 2] = 0xff; b[n - 1] = 0xd9;
+  return new Response(b.buffer, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
+}
+
+globalThis.fetch = async function (url, opt) {
+  const u = String(url);
+  if (u.includes('moonshot.cn')) {
+    kimiCalls++;
+    const body = JSON.parse(opt.body);
+    const p = body.messages[1].content;
+    if (p.includes('基础设定')) return mockKimi(JSON.stringify({ logline: 'A test logline', loglineZh: '测试一句话', genreTags: ['a', 'b', 'c'], setting: '测试世界观', themes: ['x', 'y'], cpDynamics: '推拉', paywallStrategy: '卡点' }));
+    if (p.includes('主要人物')) return mockKimi(JSON.stringify({ mainChars: [1, 2, 3, 4, 5, 6].map((i) => ({ name: 'C' + i, role: 'R' + i, want: 'W' + i, flaw: 'F' + i, arc: 'A' + i })) }));
+    if (p.includes('五幕主线结构')) return mockKimi(JSON.stringify({ fiveActs: [1, 2, 3, 4, 5].map((i) => ({ act: '第' + i + '幕', title: 'T' + i, eps: i + '-' + i * 14, summary: 'S' + i, keyTurns: ['a', 'b'] })) }));
+    if (p.includes('分集梗概 JSON')) {
+      const m = p.match(/第 (\d+) 至 (\d+) 集/);
+      const eps = [];
+      for (let e = Number(m[1]); e <= Number(m[2]); e++) eps.push({ ep: e, title: 'Ep' + e, hook: 'H' + e, beat: 'B' + e, paymark: e % 6 === 0 ? '第' + e / 6 + '卡' : '' });
+      return mockKimi(JSON.stringify({ episodes: eps }));
+    }
+    if (p.includes('完整剧本')) {
+      const m = p.match(/第 (\d+) 集完整剧本/);
+      const ep = Number(m[1]);
+      return mockKimi(JSON.stringify({ episodes: [{ ep, title: 'Ep' + ep, hook: 'H' + ep, scenes: [
+        { no: 1, slug: 'INT. A - DAY', action: 'act', lines: [{ s: 'C1', l: 'Hello', lZh: '你好' }] },
+        { no: 2, slug: 'EXT. B - NIGHT', action: 'act2', lines: [{ s: 'C2', l: 'Hi', lZh: '嗨' }] },
+      ] }] }));
+    }
+    if (p.includes('视觉资产')) return mockKimi(JSON.stringify({ key_art: 'ka', char_lead: 'cl', char_second: 'cs', scene_main: 'sm', scene_twist: 'st' }));
+    return mockKimi('{}');
+  }
+  if (u.includes('mchost.guru')) {
+    imgCalls++;
+    if (!u.includes('api_key=test-img-key')) return new Response(JSON.stringify({ code: 1001 }), { status: 401 });
+    return mockJpeg(3);
+  }
+  return realFetch(url, opt);
+};
+
+const D = async (id, body, e) => {
+  const r = await idMod.onRequest({ request: patch(id, 'test-admin-token', body), env: e || envAI, params: { id } });
+  return { status: r.status, j: await r.json().catch(() => ({})) };
+};
+
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'AI Drive Test' }), env: envAI, waitUntil });
+const IDG = (await r.json()).id;
+
+r = await idMod.onRequest({ request: patch(IDG, null, { action: 'drive' }), env: envAI, params: { id: IDG } });
+check('drive 无凭据 → 401', r.status === 401);
+
+let d = await D(IDG, { action: 'request-generate', stage: 'outline' });
+check('request-generate 大纲 → requested', d.status === 200 && d.j.stageStatus === 'requested');
+
+d = await D(IDG, { action: 'drive' });
+check('drive 大纲第1批 → draft + 设定', d.status === 200 && d.j.stageStatus === 'draft' && d.j.submission.stages.outline.content.setting === '测试世界观');
+check('genBatch 步进到 2', d.j.submission.stages.outline.genBatch.step === 2);
+check('事件流含大纲进度', d.j.submission.events.some((e) => e.type === 'progress' && e.stage === 'outline'));
+
+d = await D(IDG, { action: 'drive' });
+check('drive 大纲第2批 → 6 人物', d.status === 200 && d.j.submission.stages.outline.content.mainChars.length === 6);
+
+d = await D(IDG, { action: 'drive' });
+check('drive 大纲第3批 → 五幕 + 待确认', d.j.stageStatus === 'pending_review' && d.j.submission.stages.outline.content.fiveActs.length === 5);
+check('大纲完成后 genBatch 清理', !d.j.submission.stages.outline.genBatch);
+check('大纲完成后锁释放', !d.j.submission.genLock);
+check('大纲 ready 事件（AI）', d.j.submission.events.some((e) => e.type === 'ready' && e.label.includes('大纲')));
+
+d = await D(IDG, { action: 'decision', stage: 'outline', decision: 'approved' });
+check('确认大纲 → 分集梗概', d.j.stage === 'synopsis');
+
+d = await D(IDG, { action: 'request-generate', stage: 'synopsis' });
+d = await D(IDG, { action: 'drive' });
+check('drive 梗概第1批 → 12/72 draft', d.j.stageStatus === 'draft' && d.j.submission.stages.synopsis.content.episodes.length === 12 && d.j.submission.stages.synopsis.progress.done === 12);
+
+for (let i = 0; i < 5; i++) d = await D(IDG, { action: 'drive' });
+check('drive 梗概 6 批全部完成 → 72 集 + 待确认', d.j.stageStatus === 'pending_review' && d.j.submission.stages.synopsis.content.episodes.length === 72);
+check('梗概含付费卡点', d.j.submission.stages.synopsis.content.episodes.some((e) => e.paymark));
+
+d = await D(IDG, { action: 'decision', stage: 'synopsis', decision: 'approved' });
+d = await D(IDG, { action: 'request-generate', stage: 'script' });
+d = await D(IDG, { action: 'drive' });
+check('drive 剧本第1集 → draft + progress 1/72', d.j.stageStatus === 'draft' && d.j.submission.stages.script.progress.written === 1);
+const ep1 = d.j.submission.stages.script.content.episodes[0];
+check('剧本第1集结构完整（2 场景对白）', ep1 && ep1.ep === 1 && ep1.scenes.length === 2 && ep1.scenes[0].lines[0].lZh === '你好');
+
+r = await idMod.onRequest({ request: get(IDG, null), env: envAI, params: { id: IDG } });
+j = await r.json();
+check('公开 stageStatuses 反映 script=draft', j.stageStatuses.script === 'draft' && j.stageStatuses.synopsis === 'approved');
+
+const beforeCalls = kimiCalls;
+d = await D(IDG, { action: 'stage-content', stage: 'script', content: { episodes: Array.from({ length: 72 }, (_, i) => ({ ep: i + 1, title: 'T', hook: 'H', scenes: [] })) } });
+check('补齐 72 集 → 待确认', d.j.stageStatus === 'pending_review');
+d = await D(IDG, { action: 'decision', stage: 'script', decision: 'approved' });
+check('确认剧本 → 视觉资产待选择', d.j.stage === 'assets' && d.j.stageStatus === 'awaiting_choice');
+
+d = await D(IDG, { action: 'assets-choice', choice: 'generate' });
+check('选择生成资产 → generating', d.j.stageStatus === 'generating');
+
+d = await D(IDG, { action: 'drive' });
+check('drive 资产第1张 → key_art 入库 + 1/5', d.status === 200 && d.j.submission.stages.assets.content.items.length === 1 && d.j.submission.stages.assets.content.items[0].key === 'key_art');
+const kvImg = await globalThis.SUBMISSIONS_KV.get('sub_' + IDG + '_img_key_art', { type: 'arrayBuffer' });
+check('图片已写入 KV（JPEG bytes）', kvImg && kvImg.byteLength === 3 * 1024 && new Uint8Array(kvImg)[0] === 0xff);
+
+for (let i = 0; i < 4; i++) d = await D(IDG, { action: 'drive' });
+check('drive 5 张图全部完成 → 待确认', d.j.stageStatus === 'pending_review' && d.j.submission.stages.assets.content.items.length === 5);
+check('速创调用 5 次（api_key 鉴权）', imgCalls === 5);
+check('Kimi 调用计数合理（大纲3+梗概6+剧本1+资产prompt1=11）', kimiCalls === 11, 'kimiCalls=' + kimiCalls);
+check('资产阶段仅 prompt 批次调用 Kimi（图片不消耗文本调用）', kimiCalls === beforeCalls + 1, 'kimiCalls=' + kimiCalls + ' before=' + beforeCalls);
+
+d = await D(IDG, { action: 'decision', stage: 'assets', decision: 'approved' });
+check('确认资产 → 发布阶段', d.j.stage === 'publish');
+
+d = await D(IDG, { action: 'publish-done', feishuDocUrl: 'https://x.feishu.cn/docx/abc', pageUrl: 'https://x/page' });
+check('发布完成 → done', d.j.stage === 'done');
+
+d = await D(IDG, { action: 'drive' });
+check('done 阶段 drive → 400 NOT_GENERATING', d.status === 400 && d.j.error === 'NOT_GENERATING');
+
+const envNoKey = { ...env };
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'No Key Test' }), env: envNoKey, waitUntil });
+const IDN = (await r.json()).id;
+await D(IDN, { action: 'request-generate', stage: 'outline' }, envNoKey);
+d = await D(IDN, { action: 'drive' }, envNoKey);
+check('未配 KIMI_API_KEY → 返回 KEY_UNSET 错误（降级不崩溃）', d.status === 200 && /KIMI_KEY_UNSET/.test(d.j.error || ''));
+check('失败也释放锁', !d.j.submission.genLock);
+
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'Lock Test' }), env: envAI, waitUntil });
+const IDL = (await r.json()).id;
+await D(IDL, { action: 'stage-content', stage: 'outline', content: { logline: 'x' } });
+await D(IDL, { action: 'decision', stage: 'outline', decision: 'approved' });
+await D(IDL, { action: 'stage-content', stage: 'synopsis', ready: true, content: { episodes: [{ ep: 1, title: 'T', hook: 'H', beat: 'B', paymark: '' }] } });
+await D(IDL, { action: 'decision', stage: 'synopsis', decision: 'approved' });
+await D(IDL, { action: 'stage-content', stage: 'script', content: { episodes: [{ ep: 1, title: 'T', hook: 'H', scenes: [] }] } });
+await D(IDL, { action: 'decision', stage: 'script', decision: 'approved' });
+await D(IDL, { action: 'assets-choice', choice: 'generate' });
+const rawLock = JSON.parse(await globalThis.SUBMISSIONS_KV.get('sub_' + IDL));
+rawLock.genLock = new Date().toISOString();
+await globalThis.SUBMISSIONS_KV.put('sub_' + IDL, JSON.stringify(rawLock));
+const kimiBefore = kimiCalls;
+d = await D(IDL, { action: 'drive' });
+check('锁有效期内 drive → locked 且不生成', d.j.locked === true && kimiCalls === kimiBefore);
+
+const envNoImgKey = { ...env, KIMI_API_KEY: 'k', SUCHUANG_API_KEY: '' };
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'No Img Key' }), env: envNoImgKey, waitUntil });
+const IDZ = (await r.json()).id;
+await D(IDZ, { action: 'stage-content', stage: 'outline', content: { logline: 'x' } }, envNoImgKey);
+await D(IDZ, { action: 'decision', stage: 'outline', decision: 'approved' }, envNoImgKey);
+await D(IDZ, { action: 'stage-content', stage: 'synopsis', ready: true, content: { episodes: [{ ep: 1, title: 'T', hook: 'H', beat: 'B', paymark: '' }] } }, envNoImgKey);
+await D(IDZ, { action: 'decision', stage: 'synopsis', decision: 'approved' }, envNoImgKey);
+await D(IDZ, { action: 'stage-content', stage: 'script', content: { episodes: [{ ep: 1, title: 'T', hook: 'H', scenes: [] }] } }, envNoImgKey);
+await D(IDZ, { action: 'decision', stage: 'script', decision: 'approved' }, envNoImgKey);
+await D(IDZ, { action: 'assets-choice', choice: 'generate' }, envNoImgKey);
+d = await D(IDZ, { action: 'drive' }, envNoImgKey);
+check('未配 SUCHUANG_API_KEY → KEY_UNSET 错误', d.status === 200 && /SUCHUANG_KEY_UNSET/.test(d.j.error || ''));
+
+globalThis.fetch = realFetch;
+
 await Promise.allSettled(pending);
 console.log('\n结果：' + passed + ' 通过 / ' + failed + ' 失败');
 process.exit(failed ? 1 : 0);

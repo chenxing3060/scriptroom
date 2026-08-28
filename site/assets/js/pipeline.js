@@ -20,7 +20,7 @@
   var STAGE_ICONS = { outline: '📌', synopsis: '🗂️', script: '🎬', assets: '🖼️', publish: '🚀', done: '🏁' };
   var POLL_SECS = 15;
 
-  var state = { token: '', role: 'admin', editKey: '', editId: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false, sumStage: '', waitTimer: null, pollTimer: null };
+  var state = { token: '', role: 'admin', editKey: '', editId: '', list: [], rec: null, curEp: 0, dirty: false, epDirty: false, sumStage: '', waitTimer: null, pollTimer: null, driveLoopOn: false };
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -62,7 +62,16 @@
     if (stage === 'outline' || stage === 'synopsis') {
       if (st === 'approved') return 1;
       if (st === 'pending_review' || st === 'rejected') return 0.85;
-      if (st === 'requested' || st === 'draft') return 0.15;
+      if (st === 'requested') return 0.1;
+      if (st === 'draft') {
+        if (stage === 'outline') {
+          if (lite || !entry) return 0.5;
+          var step = entry.genBatch && entry.genBatch.step ? entry.genBatch.step : 3;
+          return Math.min(0.1 + step / 3 * 0.75, 0.85);
+        }
+        if (lite || !entry || !entry.progress) return 0.4;
+        return Math.min(0.1 + (Number(entry.progress.done) || 0) / (Number(entry.progress.total) || 1) * 0.75, 0.85);
+      }
       return 0;
     }
     if (stage === 'script') {
@@ -139,7 +148,10 @@
   function clearTimers() {
     if (state.waitTimer) { clearInterval(state.waitTimer); state.waitTimer = null; }
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    state.driveLoopOn = false;
   }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   /* ---------- 门禁：管理员令牌 / 提交者编号+密钥 ---------- */
 
@@ -364,6 +376,9 @@
       var time = entry && entry.updatedAt ? fmtShort(entry.updatedAt) : '';
       var sub = '';
       if (s === 'script' && entry && entry.progress) sub = entry.progress.written + '/' + entry.progress.total + ' 集';
+      else if (s === 'synopsis' && entry && entry.progress) sub = entry.progress.done + '/' + entry.progress.total + ' 集';
+      else if (s === 'outline' && entry && entry.genBatch && entry.genBatch.step) sub = '第 ' + entry.genBatch.step + '/3 批';
+      else if (s === 'assets' && entry && entry.progress) sub = entry.progress.done + '/' + entry.progress.total + ' 张';
       var sum = (ss === 'approved' || ss === 'skipped' || ss === 'done') ? ' data-sum="' + s + '" title="点击查看阶段摘要"' : '';
       return '<div class="pl-node' + (s === cur ? ' active' : '') + ' st-' + esc(ss) + '"' + sum + '>' +
         '<div class="pl-node-icon">' + STAGE_ICONS[s] + '</div>' +
@@ -497,7 +512,7 @@
 
   function panelOutline(rec, entry, status) {
     if (status === 'requested' || status === 'draft' || status === 'generating')
-      return waitHtml('大纲撰写中…', '已请求 AI 撰写剧本大纲（世界观 / 人物 / 五幕主线 / 付费卡点策略），生成后可在此直接编辑。');
+      return waitHtml('大纲撰写中…', 'AI（Moonshot）正在分 3 批撰写剧本大纲：基础设定 → 主要人物 → 五幕主线，完成后可在此直接编辑确认。');
     var c = (entry && entry.content) || {};
     var charRows = (c.mainChars || []).map(function (m) { return charRowTpl(m); }).join('');
     var actCards = (c.fiveActs || []).map(function (a) { return actCardTpl(a); }).join('');
@@ -598,7 +613,7 @@
 
   function panelSynopsis(rec, entry, status) {
     if (status === 'requested' || status === 'draft')
-      return waitHtml('分集梗概撰写中…', '已请求 AI 撰写全 ' + (rec.episodes || '?') + ' 集分集梗概与钩子，生成后可在此直接编辑。');
+      return waitHtml('分集梗概撰写中…', 'AI（Moonshot）正在分批撰写全 ' + (rec.episodes || '?') + ' 集梗概（每批 12 集，含钩子与付费卡点标记），完成后可在此直接编辑确认。');
     var eps = (entry.content && entry.content.episodes) || [];
     var isEmpty = status === 'empty';
     if (!eps.length && !isEmpty) return waitHtml('分集梗概生成中…', '尚未写入内容。');
@@ -642,9 +657,9 @@
         reqBar('script', '完整剧本', '点击后由 AI 按已确认的分集梗概分批撰写全集剧本；生成期间可随时「刷新状态」查看进度。');
     if (status === 'requested' || status === 'draft') {
       var p = entry && entry.progress;
-      return waitHtml('完整剧本生成中…',
+      return waitHtml('完整剧本撰写中…',
         (p ? '已生成 ' + p.written + ' / ' + p.total + ' 集。' : '已请求 AI 分批撰写全集完整剧本。') +
-        '生成完成后可逐集在线编辑。');
+        'AI（Moonshot）按梗概逐集撰写（每集 2 场景对白），完成后可逐集在线编辑。');
     }
     var eps = (entry.content && entry.content.episodes) || [];
     if (!eps.length) return waitHtml('完整剧本生成中…', '内容尚未写入。');
@@ -829,7 +844,7 @@
         '<button type="button" class="pl-btn pl-btn-ghost" id="pl-assets-skip">跳过生图</button>' +
         '</div>';
     if (status === 'generating')
-      return waitHtml('视觉资产生成中…', '已选择生成，AI 正在产出图片并逐张上传（Key Art / 角色设定 / 场景概念）。');
+      return waitHtml('视觉资产生成中…', 'AI（速创）正在逐张产出 Key Art 封面 / 角色设定 / 场景概念图并自动入库，完成后可在此查看与确认。');
     var items = (entry.content && entry.content.items) || [];
     var gal = items.map(function (it) {
       return '<figure class="pl-asset"><img data-imgkey="' + esc(it.key) + '" alt="' + esc(it.label) + '">' +
@@ -936,42 +951,97 @@
 
   /* ---------- 面板事件绑定 ---------- */
 
-  /* 等待态可视化：已等待时长每秒跳动 + 剧本生成进度条 + 15 秒自动轮询（含倒计时，有未保存编辑时暂停） */
-  function startWaitViz(stage) {
-    var rec = state.rec;
-    var entry = entryOf(rec, stage) || {};
-    var since = entry.updatedAt || rec.updatedAt || rec.createdAt;
-    var elapsedEl = $('#pl-elapsed');
-    var barEl = $('#pl-wait-bar');
-    var tipEl = $('#pl-poll-tip');
+  /* 生成等待区进度：outline 用 genBatch(1-3)，synopsis 用 progress.done，script 用 progress.written，assets 用 progress.done */
+  function genProgressOf(stage, entry) {
+    if (!entry) return null;
+    if (entry.progress) {
+      var t = Number(entry.progress.total) || 0;
+      var w = Number(entry.progress.written != null ? entry.progress.written : entry.progress.done) || 0;
+      if (t > 0) return { done: w, total: t, label: stage === 'script' ? w + '/' + t + ' 集' : w + '/' + t };
+    }
+    if (stage === 'outline' && entry.genBatch && entry.genBatch.step) {
+      return { done: entry.genBatch.step - 1, total: 3, label: '第 ' + entry.genBatch.step + '/3 批' };
+    }
+    return null;
+  }
 
-    var p = entry.progress;
-    if (barEl && p && Number(p.total) > 0) {
+  function updateWaitBar(stage) {
+    var barEl = $('#pl-wait-bar');
+    var entry = entryOf(state.rec, stage) || {};
+    var gp = genProgressOf(stage, entry);
+    if (barEl && gp) {
       barEl.hidden = false;
       var bar = $('i', barEl);
-      if (bar) bar.style.width = Math.min(100, Math.round(Number(p.written) / Number(p.total) * 100)) + '%';
+      if (bar) bar.style.width = Math.min(100, Math.round(gp.done / gp.total * 100)) + '%';
+      var cap = $('#pl-wait-bar-cap');
+      if (cap) cap.textContent = gp.label;
+    }
+  }
+
+  /* v1.7 真实生成驱动：等待态循环 PATCH drive，边缘函数逐批调用 Moonshot / 速创并落库 */
+  function startGenDrive(stage) {
+    var entry = entryOf(state.rec, stage) || {};
+    var since = entry.updatedAt || state.rec.updatedAt || state.rec.createdAt;
+    var elapsedEl = $('#pl-elapsed');
+    var tipEl = $('#pl-poll-tip');
+
+    updateWaitBar(stage);
+    var waitBarEl = $('#pl-wait-bar');
+    if (waitBarEl && !$('#pl-wait-bar-cap') && !$('span', waitBarEl)) {
+      waitBarEl.insertAdjacentHTML('afterend', '<p class="pl-poll-tip" id="pl-wait-bar-cap" style="margin-top:4px"></p>');
     }
 
     function tickElapsed() {
-      if (elapsedEl) elapsedEl.textContent = '⏱ 已等待 ' + elapsedText(since);
+      if (elapsedEl) elapsedEl.textContent = '⏱ AI 生成中，已持续 ' + elapsedText(since);
     }
     if (elapsedEl) { elapsedEl.hidden = false; tickElapsed(); }
+    if (state.waitTimer) clearInterval(state.waitTimer);
     state.waitTimer = setInterval(tickElapsed, 1000);
 
-    var left = POLL_SECS;
-    function tip() {
-      if (!tipEl) return;
-      tipEl.textContent = state.dirty
-        ? '检测到未保存的编辑，自动刷新已暂停'
-        : '每 ' + POLL_SECS + ' 秒自动刷新，' + left + ' 秒后检查最新进度（也可点上方「刷新状态」）';
-    }
-    if (tipEl) { tipEl.hidden = false; tip(); }
-    state.pollTimer = setInterval(function () {
-      if (state.dirty) { left = POLL_SECS; tip(); return; }
-      left--;
-      if (left <= 0) { loadDetail(state.rec.id); return; }
-      tip();
-    }, 1000);
+    function tip(msg) { if (tipEl) { tipEl.hidden = false; tipEl.textContent = msg; } }
+    tip('正在连接 AI 生成管线…');
+
+    if (state.driveLoopOn) return; // 防重入：面板局部重渲染不重启循环
+    state.driveLoopOn = true;
+
+    var stopped = false;
+    (function loop() {
+      if (stopped || state.rec == null) { state.driveLoopOn = false; return; }
+      if (state.dirty) { tip('检测到未保存的编辑，自动生成已暂停——保存后自动继续'); setTimeout(loop, 3000); return; }
+      tip('AI 正在生成当前批次（每批约 10-20 秒，完成后自动推进，无需手动刷新）…');
+      api('PATCH', '/api/submissions/' + state.rec.id, { action: 'drive' }).then(function (j) {
+        if (stopped) return;
+        var prevStage = stage;
+        if (j && j.submission) state.rec = j.submission;
+        if (j && j.error) {
+          if (/KEY_UNSET/.test(j.error)) {
+            state.driveLoopOn = false;
+            tip('⚠ AI 生成未启用：' + j.error + '。可联系管理员在 EdgeOne 环境变量配置，或点「刷新状态」稍后重试。');
+            return;
+          }
+          tip('本批生成失败：' + j.error + '，8 秒后自动重试…');
+          setTimeout(loop, 8000);
+          return;
+        }
+        if (j && j.locked) { tip('另一会话正在生成本条记录，等待中…'); setTimeout(loop, 4000); return; }
+        if (j && j.idle) { state.driveLoopOn = false; tip('当前阶段无需生成驱动。'); return; }
+
+        var st = statusOf(state.rec, prevStage);
+        var still = st === 'requested' || st === 'draft' || (prevStage === 'assets' && st === 'generating');
+        renderTimeline();
+        if (still) {
+          updateWaitBar(prevStage);
+          setTimeout(loop, 2000);
+        } else {
+          state.driveLoopOn = false;
+          loadDetail(state.rec.id); // 本阶段生成完毕（或推进阶段），全量刷新进入编辑确认视图
+        }
+      }).catch(function (ex) {
+        if (stopped) return;
+        tip('连接中断：' + ex.message + '，5 秒后重试…（请保持页面打开）');
+        setTimeout(loop, 5000);
+      });
+    })();
   }
 
   function bindPanel(stage, status) {
@@ -992,7 +1062,7 @@
       loadAssetImages();
     }
 
-    if ($('#pl-elapsed')) startWaitViz(stage);
+    if ($('#pl-elapsed')) startGenDrive(stage);
   }
 
   /* ---------- init ---------- */

@@ -185,6 +185,332 @@ function errOut(status, error, message) {
   return { err: { s: status, b: { ok: false, error: error, message: message } } };
 }
 
+/* ============ v1.7 真实 AI 生成引擎（Moonshot / 速创） ============ */
+
+const PAIRING_NAMES = { bg: 'BG 男女主', bl: 'BL 男男', gl: 'GL 女女' };
+const CATEGORY_NAMES = {
+  'fated-mates': '狼人命定 Fated Mates', billionaire: '亿万总裁 Billionaire',
+  mafia: '黑帮契约 Mafia', rebirth: '重生复仇 Rebirth',
+  'hidden-identity': '隐藏身份 Hidden Identity', contract: '契约婚姻 Contract Marriage',
+};
+const GEN_SYS = '你是北美本土竖屏女频短剧（60-80集）的资深编剧策划，深谙 ReelShort / DramaBox 风格：强钩子、快节奏、高频卡点。输出必须是合法 JSON（无 markdown、无注释、无尾随逗号），英文字段用地道北美口语，中文字段简洁有力。';
+const LOCK_MS = 90 * 1000;
+const SYN_BATCH = 12;   // 梗概每批集数（单批 ≤12s 约束下 ≤600 输出 token）
+const OUTLINE_STEPS = 3; // 大纲拆 3 批：设定 / 人物 / 五幕
+
+/* Moonshot（OpenAI 兼容）非流式调用，json_object 模式；不传 temperature（k 系列仅允许 1） */
+async function kimiChat(env, userPrompt, maxTokens) {
+  const key = env.KIMI_API_KEY || '';
+  if (!key) return { err: 'KIMI_KEY_UNSET（请在项目环境变量配置 KIMI_API_KEY）' };
+  const baseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
+  const model = env.KIMI_MODEL || 'moonshot-v1-32k';
+  const res = await fetch(baseUrl + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: model,
+      messages: [{ role: 'system', content: GEN_SYS }, { role: 'user', content: userPrompt }],
+      max_tokens: maxTokens, response_format: { type: 'json_object' },
+    }),
+  });
+  if (!res.ok) {
+    let msg = '';
+    try { msg = ((await res.json()) || {}).error || {}; } catch (_) {}
+    return { err: 'KIMI_HTTP_' + res.status + (msg.message ? '：' + String(msg.message).slice(0, 80) : '') };
+  }
+  let data;
+  try { data = await res.json(); } catch (_) { return { err: 'KIMI_BAD_RESPONSE' }; }
+  const c = data && data.choices && data.choices[0];
+  if (!c || !c.message || !c.message.content) return { err: 'KIMI_EMPTY_CONTENT' };
+  return { text: c.message.content };
+}
+
+/* 容错 JSON 解析：strip 代码块 / 截取最外层花括号 */
+function parseJsonLoose(s) {
+  if (!s || typeof s !== 'string') return null;
+  let t = s.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try { return JSON.parse(t); } catch (_) {}
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (_) {} }
+  return null;
+}
+
+/* 速创生图：跟随重定向，api_key 走 query（重定向安全），返回 base64 */
+async function genImage(env, prompt, size) {
+  const key = env.SUCHUANG_API_KEY || '';
+  if (!key) return { err: 'SUCHUANG_KEY_UNSET（请在项目环境变量配置 SUCHUANG_API_KEY）' };
+  const api = env.SUCHUANG_IMAGE_API || 'https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image';
+  const url = api + '?prompt=' + encodeURIComponent(String(prompt).slice(0, 600)) +
+    '&image_size=' + encodeURIComponent(size || 'square') + '&api_key=' + encodeURIComponent(key);
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) return { err: 'IMG_HTTP_' + res.status };
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length < 2048) return { err: 'IMG_TOO_SMALL（疑似占位图）' };
+  if (bytes.length > 400 * 1024) return { err: 'IMG_TOO_LARGE（' + Math.round(bytes.length / 1024) + 'KB > 400KB）' };
+  if (!(bytes[0] === 0xff && bytes[1] === 0xd8)) return { err: 'IMG_NOT_JPEG' };
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  return { b64: btoa(bin) };
+}
+
+function outlineCtx(rec) {
+  const o = (rec.stages && rec.stages.outline && rec.stages.outline.content) || {};
+  const chars = Array.isArray(o.mainChars)
+    ? o.mainChars.map(function (m) { return m.name + '（' + (m.role || '') + '）'; }).join('、') : '';
+  return {
+    o: o, chars: chars,
+    brief: '剧名《' + rec.title + '》｜' + (PAIRING_NAMES[rec.pairing] || rec.pairing || '') +
+      '｜母题：' + (CATEGORY_NAMES[rec.category] || rec.category || '') + '｜' + (Number(rec.episodes) || 72) + '集' +
+      '｜Logline：' + (rec.idea || o.logline || ''),
+  };
+}
+
+/* ---- 大纲：3 批（设定→人物→五幕），每批一次 Kimi 调用 ---- */
+async function genOutlineStep(store, rec, env) {
+  const entry = rec.stages.outline;
+  const total = Number(rec.episodes) || 72;
+  const step = (entry.genBatch && entry.genBatch.step) || 1;
+  const ctx = outlineCtx(rec);
+  let r, parsed;
+
+  if (step === 1) {
+    r = await kimiChat(env, ctx.brief + '\n\n生成本剧大纲的基础设定 JSON（本次只做设定，不含人物与分幕）：\n' +
+      '{"logline":"英文一句话 logline","loglineZh":"中文一句话","genreTags":["3个英文题材标签"],"' +
+      'setting":"世界观设定120字（时代/地点/规则/氛围）","themes":["3个核心主题词"],"' +
+      'cpDynamics":"主角关系与推拉动力学120字","paywallStrategy":"付费卡点策略100字（卡点密度与钩子类型）"}\n只输出 JSON。', 900);
+    if (r.err) throw new Error(r.err);
+    parsed = parseJsonLoose(r.text);
+    if (!parsed || !parsed.setting) throw new Error('大纲设定批次结构不完整');
+    entry.content = Object.assign({}, parsed);
+    entry.genBatch = { kind: 'outline', step: 2 };
+    entry.status = 'draft';
+    addEvent(rec, 'progress', 'outline', '大纲生成中：设定完成');
+  } else if (step === 2) {
+    r = await kimiChat(env, ctx.brief + '\n已有设定：' + JSON.stringify(entry.content).slice(0, 900) +
+      '\n\n基于以上设定生成 6 个主要人物 JSON：\n' +
+      '{"mainChars":[{"name":"英文名","role":"身份/立场","want":"核心欲望","flaw":"性格缺陷","arc":"成长弧光"}]}\n' +
+      '恰好 6 人：男女主 + 各 1 个核心对手 + 2 个关键配角。只输出 JSON。', 900);
+    if (r.err) throw new Error(r.err);
+    parsed = parseJsonLoose(r.text);
+    if (!parsed || !Array.isArray(parsed.mainChars) || parsed.mainChars.length < 4) throw new Error('人物批次结构不完整');
+    entry.content.mainChars = parsed.mainChars;
+    entry.genBatch = { kind: 'outline', step: 3 };
+    addEvent(rec, 'progress', 'outline', '大纲生成中：人物完成');
+  } else {
+    r = await kimiChat(env, ctx.brief + '\n已有设定与人物：' + JSON.stringify(entry.content).slice(0, 1600) +
+      '\n\n生成五幕主线结构 JSON（恰好 5 幕，eps 覆盖 1 到 ' + total + ' 集且连续不重叠）：\n' +
+      '{"fiveActs":[{"act":"第一幕","title":"幕标题","eps":"1-14","summary":"本幕剧情120字","keyTurns":["转折1","转折2"]}]}\n只输出 JSON。', 1000);
+    if (r.err) throw new Error(r.err);
+    parsed = parseJsonLoose(r.text);
+    if (!parsed || !Array.isArray(parsed.fiveActs) || parsed.fiveActs.length < 4) throw new Error('五幕批次结构不完整');
+    entry.content.fiveActs = parsed.fiveActs;
+    delete entry.genBatch;
+    entry.status = 'pending_review';
+    entry.progress = null;
+    addEvent(rec, 'ready', 'outline', '「大纲」已生成（AI）');
+  }
+  entry.updatedAt = new Date().toISOString();
+  if (rec.status === 'received') rec.status = 'generating';
+  touch(rec);
+  await saveRecord(store, rec);
+  return { data: { stage: 'outline', stageStatus: entry.status, generated: entry.status === 'pending_review', submission: rec } };
+}
+
+/* ---- 分集梗概：每批 SYN_BATCH 集 ---- */
+async function genSynopsisStep(store, rec, env) {
+  const entry = rec.stages.synopsis;
+  const total = Number(rec.episodes) || 72;
+  entry.content = entry.content && typeof entry.content === 'object' ? entry.content : {};
+  if (!Array.isArray(entry.content.episodes)) entry.content.episodes = [];
+  const eps = entry.content.episodes;
+  if (eps.length >= total) {
+    entry.status = 'pending_review';
+    entry.updatedAt = new Date().toISOString();
+    addEvent(rec, 'ready', 'synopsis', '「分集梗概」已生成（AI）');
+    await saveRecord(store, rec);
+    return { data: { stage: 'synopsis', stageStatus: 'pending_review', generated: true, submission: rec } };
+  }
+  const from = eps.length + 1;
+  const to = Math.min(eps.length + SYN_BATCH, total);
+  const ctx = outlineCtx(rec);
+  const acts = Array.isArray(ctx.o.fiveActs)
+    ? ctx.o.fiveActs.map(function (a) { return a.act + '（' + (a.eps || '') + '）' + (a.summary || '').slice(0, 60); }).join('；') : '';
+  const prev = eps.slice(-2).map(function (e) { return 'EP' + e.ep + ' ' + e.title + '：' + (e.hook || ''); }).join('\n');
+
+  const r = await kimiChat(env, ctx.brief + '\n五幕结构：' + (acts || '未提供') +
+    '\n人物：' + (ctx.chars || '未提供') +
+    (prev ? '\n前情（最后2集钩子，需衔接）：\n' + prev : '') +
+    '\n\n生成第 ' + from + ' 至 ' + to + ' 集的分集梗概 JSON（恰好 ' + (to - from + 1) + ' 集，ep 连续）：\n' +
+    '{"episodes":[{"ep":' + from + ',"title":"英文短集名","hook":"结尾钩子（本集最后悬念）40字内","beat":"本集剧情节拍70字","paymark":"付费卡点标记，如 第3卡；无卡点则空字符串"}]}\n只输出 JSON。', 1800);
+  if (r.err) throw new Error(r.err);
+  const parsed = parseJsonLoose(r.text);
+  if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('梗概批次结构不完整');
+
+  const map = {};
+  for (const e of eps) map[e.ep] = e;
+  for (const e of parsed.episodes) {
+    const se = sanitizeSynopsisEp(e);
+    if (se && se.ep >= from && se.ep <= to) map[se.ep] = se;
+  }
+  entry.content.episodes = Object.keys(map).map(Number).sort(function (a, b) { return a - b; }).map(function (k) { return map[k]; });
+  const done = entry.content.episodes.length;
+  entry.status = done >= total ? 'pending_review' : 'draft';
+  entry.progress = { total: total, done: done };
+  entry.updatedAt = new Date().toISOString();
+  if (rec.status === 'received') rec.status = 'generating';
+  touch(rec);
+  addEvent(rec, done >= total ? 'ready' : 'progress', 'synopsis',
+    done >= total ? '「分集梗概」已生成（AI）' : '梗概生成中：' + done + '/' + total + ' 集');
+  await saveRecord(store, rec);
+  return { data: { stage: 'synopsis', stageStatus: entry.status, generated: done >= total, submission: rec } };
+}
+
+/* ---- 完整剧本：每批 1 集（2 场景 × 4-5 行对白） ---- */
+async function genScriptStep(store, rec, env) {
+  const entry = rec.stages.script;
+  const total = Number(rec.episodes) || 72;
+  entry.content = entry.content && typeof entry.content === 'object' ? entry.content : {};
+  if (!Array.isArray(entry.content.episodes)) entry.content.episodes = [];
+  const eps = entry.content.episodes;
+  if (eps.length >= total) {
+    entry.status = 'pending_review';
+    entry.updatedAt = new Date().toISOString();
+    addEvent(rec, 'ready', 'script', '「完整剧本」已生成（AI）');
+    await saveRecord(store, rec);
+    return { data: { stage: 'script', stageStatus: 'pending_review', generated: true, submission: rec } };
+  }
+  const from = eps.length + 1;
+  const to = Math.min(eps.length + 1, total);
+  const syn = (rec.stages.synopsis && rec.stages.synopsis.content && rec.stages.synopsis.content.episodes) || [];
+  const need = syn.filter(function (e) { return e.ep >= from && e.ep <= to; });
+  if (!need.length) throw new Error('缺少第 ' + from + ' 集分集梗概，无法撰写剧本');
+  const ctx = outlineCtx(rec);
+  const charBrief = Array.isArray(ctx.o.mainChars)
+    ? ctx.o.mainChars.map(function (m) { return m.name + '：' + (m.role || '') + '｜欲望 ' + (m.want || '') + '｜缺陷 ' + (m.flaw || ''); }).join('\n') : '';
+  const prevEp = eps.length ? eps[eps.length - 1] : null;
+
+  const r = await kimiChat(env, ctx.brief + '\n人物表：\n' + (charBrief || '未提供') +
+    (prevEp ? '\n上一集（EP' + prevEp.ep + '）结尾钩子：' + (prevEp.hook || '') + '，本集开头需自然承接' : '') +
+    '\n本集梗概：' + need.map(function (e) { return 'EP' + e.ep + '《' + e.title + '》节拍：' + (e.beat || '') + '；结尾钩子：' + (e.hook || ''); }).join('\n') +
+    '\n\n撰写第 ' + from + ' 集完整剧本 JSON：\n' +
+    '{"episodes":[{"ep":' + from + ',"title":"沿用梗概英文集名","hook":"本集结尾钩子","scenes":[{"no":1,"slug":"INT. 场景名 - 日/夜","action":"场景与动作描述","lines":[{"s":"角色英文名","l":"英文台词（北美口语）","lZh":"中文台词"}]},{"no":2,"slug":"EXT. 场景名 - 日/夜","action":"...","lines":[...]}]}]}\n' +
+    '恰好 2 个场景、每场景 4-5 行对白，只输出 JSON。', 1600);
+  if (r.err) throw new Error(r.err);
+  const parsed = parseJsonLoose(r.text);
+  if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('剧本批次结构不完整');
+
+  const map = {};
+  for (const e of eps) map[e.ep] = e;
+  for (const e of parsed.episodes) {
+    const se = sanitizeEpisode(e);
+    if (se && se.ep >= from && se.ep <= to && JSON.stringify(se).length <= MAX_EP_JSON) map[se.ep] = se;
+  }
+  entry.content.episodes = Object.keys(map).map(Number).sort(function (a, b) { return a - b; }).map(function (k) { return map[k]; });
+  const done = entry.content.episodes.length;
+  entry.progress = { total: total, written: done };
+  entry.status = done >= total ? 'pending_review' : 'draft';
+  entry.updatedAt = new Date().toISOString();
+  if (rec.status === 'received') rec.status = 'generating';
+  touch(rec);
+  addEvent(rec, done >= total ? 'ready' : 'progress', 'script',
+    done >= total ? '「完整剧本」已生成（AI）' : '剧本撰写中：' + done + '/' + total + ' 集');
+  await saveRecord(store, rec);
+  return { data: { stage: 'script', stageStatus: entry.status, generated: done >= total, submission: rec } };
+}
+
+/* ---- 视觉资产：先 1 批生成 5 条生图 prompt，再逐张速创生图 ---- */
+const ASSET_PLAN = [
+  { key: 'key_art', label: 'Key Art 主视觉', size: 'portrait_16_9' },
+  { key: 'char_lead', label: '主角人设', size: 'portrait_4_3' },
+  { key: 'char_second', label: '对手人设', size: 'portrait_4_3' },
+  { key: 'scene_main', label: '核心场景', size: 'landscape_4_3' },
+  { key: 'scene_twist', label: '高潮剧情', size: 'landscape_4_3' },
+];
+
+async function genAssetsStep(store, rec, env) {
+  const entry = rec.stages.assets;
+  entry.content = entry.content && typeof entry.content === 'object' ? entry.content : {};
+  if (!Array.isArray(entry.content.items)) entry.content.items = [];
+  const items = entry.content.items;
+  const remaining = ASSET_PLAN.filter(function (p) { return !items.some(function (i) { return i && i.key === p.key; }); });
+
+  if (!remaining.length) {
+    entry.status = 'pending_review';
+    entry.updatedAt = new Date().toISOString();
+    addEvent(rec, 'ready', 'assets', '「视觉资产」已生成（AI）');
+    await saveRecord(store, rec);
+    return { data: { stage: 'assets', stageStatus: 'pending_review', generated: true, submission: rec } };
+  }
+
+  const ctx = outlineCtx(rec);
+  if (!entry.content.prompts || !entry.content.prompts[remaining[0].key]) {
+    const r = await kimiChat(env, ctx.brief + '\n设定：' + String(ctx.o.setting || '').slice(0, 200) +
+      '\n人物：' + (ctx.chars || '') +
+      '\n\n为本剧生成 5 张视觉资产的英文生图 prompt JSON（每条 50-80 词，统一 cinematic 短剧海报风格，含主体/构图/光线/情绪，不含文字水印描述）：\n' +
+      '{"key_art":"主视觉海报 prompt（男女主同框张力构图）","char_lead":"主角单人立绘 prompt","char_second":"对手单人立绘 prompt","scene_main":"核心场景概念图 prompt","scene_twist":"高潮剧情概念图 prompt"}\n只输出 JSON。', 1000);
+    if (r.err) throw new Error(r.err);
+    const prompts = parseJsonLoose(r.text);
+    if (prompts) entry.content.prompts = prompts;
+  }
+
+  const plan = remaining[0];
+  const prompt = (entry.content.prompts && entry.content.prompts[plan.key]) || ('cinematic short drama poster, ' + (ctx.o.logline || rec.idea || rec.title));
+  const img = await genImage(env, prompt, plan.size);
+  if (img.err) throw new Error(img.err);
+  await store.put(PREFIX + rec.id + '_img_' + plan.key, base64ToBytes(img.b64));
+  items.push({ key: plan.key, label: plan.label, aspect: plan.size, mime: 'image/jpeg' });
+  entry.status = items.length >= ASSET_PLAN.length ? 'pending_review' : 'generating';
+  entry.progress = { total: ASSET_PLAN.length, done: items.length };
+  entry.updatedAt = new Date().toISOString();
+  touch(rec);
+  addEvent(rec, 'asset', 'assets', 'AI 生成：' + plan.label + '（' + items.length + '/' + ASSET_PLAN.length + '）');
+  await saveRecord(store, rec);
+  return { data: { stage: 'assets', stageStatus: entry.status, generated: entry.status === 'pending_review', submission: rec } };
+}
+
+/* ---- action：驱动一拍生成（前端等待态循环调用） ---- */
+async function actDrive(store, rec, body, env) {
+  const stage = stageOf(rec);
+  const genStages = { outline: 1, synopsis: 1, script: 1, assets: 1 };
+  if (!genStages[stage]) return errOut(400, 'NOT_GENERATING', '当前阶段「' + STAGE_LABELS[stage] + '」无需生成驱动');
+
+  const now = Date.now();
+  if (rec.genLock && now - new Date(rec.genLock).getTime() < LOCK_MS) {
+    return { data: { locked: true, stage: stage, stageStatus: statusOf(rec, stage), submission: rec } };
+  }
+  rec.genLock = new Date().toISOString();
+  await saveRecord(store, rec);
+
+  try {
+    rec.stages = rec.stages || {};
+    if (stage === 'outline') rec.stages.outline = rec.stages.outline || { status: 'empty', updatedAt: '', feedback: '', content: {} };
+    const entry = entryOf(rec, stage) || {};
+    const st = entry.status || 'empty';
+    let result;
+
+    if (stage === 'outline' && (st === 'requested' || st === 'empty' || st === 'draft')) result = await genOutlineStep(store, rec, env);
+    else if (stage === 'synopsis' && (st === 'requested' || st === 'empty' || st === 'draft')) result = await genSynopsisStep(store, rec, env);
+    else if (stage === 'script' && (st === 'requested' || st === 'empty' || st === 'draft')) result = await genScriptStep(store, rec, env);
+    else if (stage === 'assets' && st === 'generating') result = await genAssetsStep(store, rec, env);
+    else {
+      delete rec.genLock;
+      await saveRecord(store, rec);
+      return { data: { idle: true, stage: stage, stageStatus: st, submission: rec } };
+    }
+
+    delete rec.genLock;
+    await saveRecord(store, rec);
+    return result;
+  } catch (e) {
+    delete rec.genLock;
+    touch(rec);
+    addEvent(rec, 'progress', stage, '生成失败：' + String((e && e.message) || 'GEN_FAIL').slice(0, 50));
+    await saveRecord(store, rec);
+    return { data: { error: String((e && e.message) || 'GEN_FAIL').slice(0, 150), stage: stage, submission: rec } };
+  }
+}
+
 /* ---------------- GET ---------------- */
 
 async function onRequestGet(context) {
@@ -268,6 +594,7 @@ async function onRequestPatch(context) {
     if (!action) out = await actLegacyStatus(store, rec, body);
     else if (action === 'stage-content') out = await actStageContent(store, rec, body);
     else if (action === 'request-generate') out = await actRequestGenerate(store, rec, body);
+    else if (action === 'drive') out = await actDrive(store, rec, body, env);
     else if (action === 'decision') out = await actDecision(store, rec, body);
     else if (action === 'edit-ep') out = await actEditEp(store, rec, body);
     else if (action === 'assets-choice') out = await actAssetsChoice(store, rec, body);
@@ -539,7 +866,7 @@ async function notifyStage(env, n) {
   if (n.type === 'request') {
     title = '📥 请求生成「' + n.stageLabel + '」';
     lines.push('提交者已在编辑工作台请求 AI 撰写该阶段内容');
-    lines.push('请安排生成并写入：' + link);
+    lines.push('管线将自动分批生成（Moonshot 文本 / 速创生图），完成会再次通知：' + link);
   } else if (n.type === 'ready') {
     title = '📝 「' + n.stageLabel + '」已生成，可编辑确认';
     lines.push('请前往编辑工作台编辑并确认：' + link);
