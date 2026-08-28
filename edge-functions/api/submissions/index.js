@@ -121,19 +121,30 @@ async function onRequestGet(context) {
   if (!auth.ok) return auth.resp;
 
   const keys = [];
-  let cursor;
-  do {
-    const res = await store.list({ prefix: PREFIX, limit: 256, cursor: cursor });
-    for (const k of res.keys) keys.push(k.key);
-    cursor = res.cursor;
-  } while (cursor);
+  try {
+    let cursor;
+    do {
+      const opts = { prefix: PREFIX, limit: 256 };
+      if (cursor) opts.cursor = cursor;
+      const res = await store.list(opts);
+      const ks = (res && res.keys) || [];
+      for (let i = 0; i < ks.length; i++) {
+        const k = ks[i];
+        keys.push(typeof k === 'string' ? k : (k && (k.key || k.name)) || String(k));
+      }
+      cursor = res ? res.cursor : null;
+    } while (cursor);
+  } catch (e) {
+    return json({ ok: false, error: 'LIST_FAILED', message: 'KV list 调用失败：' + String((e && e.message) || e) }, 500);
+  }
 
   const records = [];
   for (const key of keys) {
+    if (key.indexOf('_img_') >= 0) continue;
     const raw = await store.get(key);
     if (raw) { try { records.push(JSON.parse(raw)); } catch (_) {} }
   }
-  records.sort(function (a, b) { return a.createdAt < b.createdAt ? 1 : -1; });
+  records.sort(function (a, b) { return (a.createdAt || '') < (b.createdAt || '') ? 1 : -1; });
 
   const items = records.map(function (rec) {
     const stage = rec.stage && STAGE_LABELS[rec.stage] ? rec.stage : 'outline';
