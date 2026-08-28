@@ -15,6 +15,28 @@ const CATEGORIES = {
 };
 const EPISODES = ['60', '72', '80'];
 
+const STAGE_LABELS = {
+  outline: '大纲',
+  synopsis: '分集梗概',
+  script: '完整剧本',
+  assets: '视觉资产',
+  publish: '发布上线',
+  done: '已完成',
+};
+const STAGE_ORDER = ['outline', 'synopsis', 'script', 'assets', 'publish', 'done'];
+const STAGE_STATUS_LABELS = {
+  empty: '未开始',
+  draft: '生成中',
+  pending_review: '待确认',
+  approved: '已通过',
+  rejected: '已驳回',
+  awaiting_choice: '待选择',
+  generating: '生成中',
+  skipped: '已跳过',
+  pending: '待发布',
+  done: '已完成',
+};
+
 function json(data, status) {
   return new Response(JSON.stringify(data), {
     status: status || 200,
@@ -74,6 +96,7 @@ async function onRequestPost(context) {
     createdAt: new Date().toISOString(),
     status: 'received',
     statusNote: '',
+    stage: 'outline',
     title: title,
     idea: idea,
     pairing: pairing,
@@ -111,7 +134,26 @@ async function onRequestGet(context) {
     if (raw) { try { records.push(JSON.parse(raw)); } catch (_) {} }
   }
   records.sort(function (a, b) { return a.createdAt < b.createdAt ? 1 : -1; });
-  return json({ ok: true, count: records.length, submissions: records });
+
+  const items = records.map(function (rec) {
+    const stage = rec.stage && STAGE_LABELS[rec.stage] ? rec.stage : 'outline';
+    const entry = (rec.stages && rec.stages[stage]) || null;
+    const stageStatus = stage === 'done' ? 'done' : entry && entry.status ? entry.status : 'empty';
+    const item = {};
+    for (const k of ['id', 'createdAt', 'updatedAt', 'status', 'statusNote', 'stage', 'title', 'idea', 'pairing', 'category', 'episodes', 'benchmark', 'contact']) {
+      if (rec[k] !== undefined) item[k] = rec[k];
+    }
+    item.stageLabel = STAGE_LABELS[stage];
+    item.stageStatus = stageStatus;
+    item.stageStatusLabel = STAGE_STATUS_LABELS[stageStatus] || stageStatus;
+    item.stageStatuses = {};
+    for (const s of STAGE_ORDER) {
+      const e = (rec.stages && rec.stages[s]) || null;
+      item.stageStatuses[s] = e && e.status ? e.status : 'empty';
+    }
+    return item;
+  });
+  return json({ ok: true, count: items.length, submissions: items });
 }
 
 function esc(s) {

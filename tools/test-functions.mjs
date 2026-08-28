@@ -5,8 +5,17 @@ import { pathToFileURL } from 'node:url';
 
 const kvData = new Map();
 globalThis.SUBMISSIONS_KV = {
-  async get(key) { return kvData.has(key) ? kvData.get(key) : null; },
-  async put(key, value) { kvData.set(key, String(value)); },
+  async get(key, opts) {
+    if (!kvData.has(key)) return null;
+    const v = kvData.get(key);
+    if (opts && (opts.type === 'arrayBuffer' || opts === 'arrayBuffer')) {
+      if (v instanceof Uint8Array) return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+      if (typeof v === 'string') return new TextEncoder().encode(v).buffer;
+      if (v instanceof ArrayBuffer) return v;
+    }
+    return typeof v === 'string' ? v : (v instanceof Uint8Array ? new TextDecoder().decode(v) : String(v));
+  },
+  async put(key, value) { kvData.set(key, value); },
   async delete(key) { kvData.delete(key); },
   async list({ prefix = '', limit = 256, cursor } = {}) {
     const keys = [...kvData.keys()].filter((k) => k.startsWith(prefix)).sort().slice(0, limit).map((key) => ({ key }));
@@ -108,7 +117,164 @@ r = await idMod.onRequest({ request: get(ID, null), env, params: { id: ID } });
 j = await r.json();
 check('公开查询反映新状态与备注', j.status === 'generating' && j.statusNote === '进入 Kimi K3 撰写管线');
 
-console.log('⑥ 其他方法与 KV 未绑定');
+console.log('⑥ 管线：大纲阶段');
+const P = (id, body) => idMod.onRequest({ request: patch(id, 'test-admin-token', body), env, params: { id } });
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'Pipeline Test One' }), env, waitUntil });
+const ID2 = (await r.json()).id;
+r = await P(ID2, { action: 'stage-content', stage: 'bogus' });
+check('非法阶段名 → 400 BAD_STAGE', r.status === 400 && (await r.json()).error === 'BAD_STAGE');
+r = await P(ID2, {
+  action: 'stage-content', stage: 'outline',
+  content: {
+    logline: 'A jungle heir meets a dark prince.',
+    loglineZh: '丛林继承人与黑暗王子。',
+    genreTags: ['亿万总裁', '契约婚姻'],
+    setting: 'New York / rainforest flashbacks',
+    themes: 'power vs wildness',
+    cpDynamics: 'enemies to lovers',
+    paywallStrategy: '6 walls',
+    mainChars: [{ name: 'Tarzan', nameZh: '泰山', role: '主角', arc: 'wild → tamed power' }],
+    fiveActs: [{ act: 1, title: '婚约枷锁', epRange: 'EP01-12', summary: '被卖抵债' }],
+  },
+});
+j = await r.json();
+check('大纲写入 → 200 pending_review', r.status === 200 && j.stageStatus === 'pending_review');
+r = await idMod.onRequest({ request: get(ID2, null), env, params: { id: ID2 } });
+j = await r.json();
+check('公开查询含阶段摘要（大纲·待确认）', j.stageLabel === '大纲' && j.stageStatusLabel === '待确认');
+check('首次写入同步 status=generating', j.status === 'generating');
+r = await P(ID2, { action: 'decision', stage: 'outline', decision: 'approved' });
+j = await r.json();
+check('通过大纲 → 推进到分集梗概', r.status === 200 && j.stage === 'synopsis' && j.stageLabel === '分集梗概');
+r = await P(ID2, { action: 'decision', stage: 'outline', decision: 'approved' });
+check('对非当前阶段确认 → 400 STAGE_NOT_ACTIVE', r.status === 400 && (await r.json()).error === 'STAGE_NOT_ACTIVE');
+r = await P(ID2, { action: 'stage-content', stage: 'outline', content: { logline: 'overwrite' } });
+check('对已通过阶段写入 → 409 STAGE_LOCKED', r.status === 409 && (await r.json()).error === 'STAGE_LOCKED');
+
+console.log('⑦ 管线：分集梗概（驳回反馈 → 重生成 → 通过）');
+r = await P(ID2, {
+  action: 'stage-content', stage: 'synopsis',
+  content: { episodes: [
+    { ep: 1, title: 'The Debt', hook: 'She signs', beat: 'beat 1', paymark: '' },
+    { ep: 2, title: 'Cold Welcome', hook: 'The slap', beat: 'beat 2', paymark: '💎 付费墙①' },
+  ] },
+});
+j = await r.json();
+check('梗概写入 → pending_review', j.stageStatus === 'pending_review');
+r = await P(ID2, { action: 'decision', stage: 'synopsis', decision: 'rejected' });
+check('驳回无反馈 → 400 FEEDBACK_REQUIRED', r.status === 400 && (await r.json()).error === 'FEEDBACK_REQUIRED');
+r = await P(ID2, { action: 'decision', stage: 'synopsis', decision: 'rejected', note: '钩子不够强，重写' });
+check('驳回带反馈 → 200', r.status === 200);
+r = await idMod.onRequest({ request: get(ID2, null), env, params: { id: ID2 } });
+j = await r.json();
+check('公开查询显示已驳回', j.stageStatusLabel === '已驳回');
+r = await P(ID2, { action: 'stage-content', stage: 'synopsis', content: { episodes: [{ ep: 1, title: 'T1', hook: 'H1', beat: 'B1', paymark: '' }, { ep: 2, title: 'T2', hook: 'H2+', beat: 'B2', paymark: '💎 付费墙①' }] } });
+check('重生成 → 再次 pending_review', (await r.json()).stageStatus === 'pending_review');
+r = await P(ID2, { action: 'decision', stage: 'synopsis', decision: 'approved' });
+check('通过梗概 → 推进到完整剧本', (await r.json()).stage === 'script');
+
+console.log('⑧ 管线：完整剧本（分批合并 + 模块编辑 + 驳回 + 通过）');
+const epA = { ep: 1, title: 'The Debt', hook: 'She signs', scenes: [{ no: 1, slug: 'INT. MANSION - NIGHT', action: 'Rain.', lines: [{ s: 'KANE', l: 'You owe me.', lZh: '你欠我的。' }] }] };
+const epB = { ep: 2, title: 'Cold Welcome', hook: 'The slap', scenes: [] };
+const epC = { ep: 3, title: 'First Blood', hook: 'Rival appears', scenes: [] };
+const epD = { ep: 4, title: 'The Contract', hook: 'Terms', scenes: [] };
+r = await P(ID2, { action: 'stage-content', stage: 'script', ready: false, content: { episodes: [epA, epB, { ep: 'bad', title: 'x' }] } });
+j = await r.json();
+check('首批写入（ready:false → draft）→ written=2', j.stageStatus === 'draft' && j.progress.written === 2);
+r = await P(ID2, { action: 'stage-content', stage: 'script', ready: false, content: { episodes: [epC, epD] } });
+j = await r.json();
+check('二批合并 → written=4', j.progress.written === 4);
+r = await P(ID2, { action: 'stage-content', stage: 'script', ready: false, content: { episodes: [Object.assign({}, epB, { title: 'Cold Welcome v2' })] } });
+j = await r.json();
+check('重写 EP02 按 ep 覆盖 → written 仍为 4', j.progress.written === 4);
+r = await P(ID2, { action: 'stage-content', stage: 'script', ready: true });
+check('finalize → pending_review', (await r.json()).stageStatus === 'pending_review');
+r = await idMod.onRequest({ request: get(ID2, 'test-admin-token'), env, params: { id: ID2 } });
+j = await r.json();
+const eps1 = j.submission.stages.script.content.episodes;
+check('EP02 已更新且未标记 edited', eps1.find((e) => e.ep === 2).title === 'Cold Welcome v2' && !eps1.find((e) => e.ep === 2).edited);
+r = await P(ID2, { action: 'edit-ep', ep: 2, data: { title: 'Cold Welcome (edited)', hook: 'stronger hook', scenes: [{ no: 1, slug: 'INT. HALL - DAY', action: 'Slap.', lines: [{ s: 'SIENNA', l: 'Know your place.', lZh: '摆正你的位置。' }] }] } });
+check('模块化编辑 EP02 → 200 saved', r.status === 200 && (await r.json()).saved === true);
+r = await idMod.onRequest({ request: get(ID2, 'test-admin-token'), env, params: { id: ID2 } });
+j = await r.json();
+const ep2 = j.submission.stages.script.content.episodes.find((e) => e.ep === 2);
+check('EP02 带 edited 标记且内容已更新', ep2.edited === true && ep2.title === 'Cold Welcome (edited)' && ep2.scenes[0].lines[0].s === 'SIENNA');
+r = await P(ID2, { action: 'decision', stage: 'script', decision: 'rejected', note: '对白太书面' });
+check('驳回剧本 → 200', r.status === 200);
+r = await P(ID2, { action: 'edit-ep', ep: 3, data: { title: 'First Blood v2', hook: 'x', scenes: [] } });
+check('驳回状态下仍可编辑模块', r.status === 200);
+r = await P(ID2, { action: 'stage-content', stage: 'script', ready: true });
+check('重新送审 → pending_review', (await r.json()).stageStatus === 'pending_review');
+r = await P(ID2, { action: 'decision', stage: 'script', decision: 'approved' });
+j = await r.json();
+check('通过剧本 → 推进到视觉资产·待选择', j.stage === 'assets' && j.stageStatusLabel === '待选择');
+
+console.log('⑨ 管线：资产跳过路径 + 发布 + 锁定防护');
+r = await P(ID2, { action: 'assets-choice', choice: 'skip' });
+j = await r.json();
+check('跳过生图 → 进入发布阶段', j.stage === 'publish' && j.stageStatus === 'skipped');
+r = await P(ID2, { action: 'publish-done' });
+check('发布缺链接 → 400', r.status === 400);
+r = await P(ID2, { action: 'publish-done', feishuDocUrl: 'https://allinagi.feishu.cn/docx/DEMO', pageUrl: 'https://scriptroom.allinagi.com.cn/scripts/script-demo.html' });
+j = await r.json();
+check('发布完成 → stage=done', j.stage === 'done');
+r = await idMod.onRequest({ request: get(ID2, null), env, params: { id: ID2 } });
+j = await r.json();
+check('公开查询：已完成 + 已上线', j.stageLabel === '已完成' && j.statusLabel === '已上线');
+r = await P(ID2, { action: 'edit-ep', ep: 1, data: { title: 'x', hook: 'x', scenes: [] } });
+check('非剧本阶段编辑模块 → 400 NOT_SCRIPT_STAGE', r.status === 400 && (await r.json()).error === 'NOT_SCRIPT_STAGE');
+r = await indexMod.onRequest({ request: get(null, 'test-admin-token'), env });
+j = await r.json();
+const listItem = j.submissions.find((s) => s.id === ID2);
+check('列表项含阶段摘要且剥离 stages 负载', listItem && listItem.stage === 'done' && listItem.stageStatuses && !listItem.stages);
+
+console.log('⑩ 管线：资产生成路径（选择 / 上传 / 拉取 / 送审 / 通过）');
+r = await indexMod.onRequest({ request: post({ ...valid, title: 'Pipeline Test Assets' }), env, waitUntil });
+const ID3 = (await r.json()).id;
+async function driveToAssets(id) {
+  await P(id, { action: 'stage-content', stage: 'outline', content: { logline: 'x' } });
+  await P(id, { action: 'decision', stage: 'outline', decision: 'approved' });
+  await P(id, { action: 'stage-content', stage: 'synopsis', content: { episodes: [{ ep: 1, title: 'T', hook: 'H', beat: 'B', paymark: '' }] } });
+  await P(id, { action: 'decision', stage: 'synopsis', decision: 'approved' });
+  await P(id, { action: 'stage-content', stage: 'script', content: { episodes: [epA] } });
+  await P(id, { action: 'decision', stage: 'script', decision: 'approved' });
+}
+await driveToAssets(ID3);
+r = await P(ID3, { action: 'asset-put', key: 'cover', dataBase64: Buffer.from('x').toString('base64') });
+check('待选择状态下上传 → 400 ASSET_PUT_NOT_ALLOWED', r.status === 400 && (await r.json()).error === 'ASSET_PUT_NOT_ALLOWED');
+r = await P(ID3, { action: 'assets-choice', choice: 'generate' });
+check('选择生成 → generating', (await r.json()).stageStatus === 'generating');
+const imgBytes = new Uint8Array(1200).fill(7);
+r = await P(ID3, { action: 'asset-put', key: 'cover', label: 'Key Art 封面', aspect: '9:16', dataBase64: Buffer.from(imgBytes).toString('base64') });
+check('上传图片 → 200 items=1', r.status === 200 && (await r.json()).items === 1);
+r = await P(ID3, { action: 'asset-put', key: 'Bad-Key!', dataBase64: Buffer.from('x').toString('base64') });
+check('非法 key → 400 BAD_IMG_KEY', r.status === 400 && (await r.json()).error === 'BAD_IMG_KEY');
+r = await P(ID3, { action: 'asset-put', key: 'big', dataBase64: Buffer.from(new Uint8Array(401 * 1024).fill(1)).toString('base64') });
+check('超 400KB → 413 IMG_TOO_LARGE', r.status === 413 && (await r.json()).error === 'IMG_TOO_LARGE');
+r = await idMod.onRequest({ request: new Request(BASE + '/' + ID3 + '?img=cover'), env, params: { id: ID3 } });
+check('无 token 拉图 → 401', r.status === 401);
+r = await idMod.onRequest({ request: new Request(BASE + '/' + ID3 + '?img=cover', { headers: { Authorization: 'Bearer test-admin-token' } }), env, params: { id: ID3 } });
+const imgBody = await r.arrayBuffer();
+check('管理员拉图 → 200 二进制等长', r.status === 200 && imgBody.byteLength === 1200 && (r.headers.get('Content-Type') || '').startsWith('image/'));
+r = await idMod.onRequest({ request: new Request(BASE + '/' + ID3 + '?img=missing', { headers: { Authorization: 'Bearer test-admin-token' } }), env, params: { id: ID3 } });
+check('不存在的图 → 404', r.status === 404);
+r = await P(ID3, { action: 'stage-content', stage: 'assets', content: { items: [{ key: 'cover', label: 'Key Art 封面', aspect: '9:16', mime: 'image/jpeg' }] } });
+check('资产送审 → pending_review', (await r.json()).stageStatus === 'pending_review');
+r = await P(ID3, { action: 'decision', stage: 'assets', decision: 'approved' });
+check('通过资产 → 发布阶段', (await r.json()).stage === 'publish');
+r = await P(ID3, { action: 'publish-done', feishuDocUrl: 'https://allinagi.feishu.cn/docx/D2', pageUrl: 'https://scriptroom.allinagi.com.cn/scripts/d2.html' });
+check('发布完成', (await r.json()).stage === 'done');
+
+console.log('⑪ 旧记录兼容');
+const OLD_ID = 'SR_20260101_OLDREC01';
+kvData.set('sub_' + OLD_ID, JSON.stringify({ id: OLD_ID, createdAt: '2026-01-01T00:00:00Z', status: 'received', statusNote: '', title: 'Legacy', idea: 'old record without stages', pairing: 'bg', category: 'mafia', episodes: '60', benchmark: '', contact: '' }));
+r = await idMod.onRequest({ request: get(OLD_ID, null), env, params: { id: OLD_ID } });
+j = await r.json();
+check('旧记录缺省阶段：大纲·未开始', j.stage === 'outline' && j.stageLabel === '大纲' && j.stageStatusLabel === '未开始');
+r = await idMod.onRequest({ request: patch(OLD_ID, 'test-admin-token', { status: 'reviewing', note: 'legacy flow still works' }), env, params: { id: OLD_ID } });
+check('旧版 PATCH {status} 依然可用', r.status === 200 && (await r.json()).statusLabel === '人工审核中');
+
+console.log('⑫ 其他方法与 KV 未绑定');
 r = await indexMod.onRequest({ request: new Request(BASE, { method: 'DELETE' }), env });
 check('DELETE /api/submissions → 405', r.status === 405);
 const saved = globalThis.SUBMISSIONS_KV;
