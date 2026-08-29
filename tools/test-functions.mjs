@@ -484,6 +484,7 @@ check('request-generate 大纲 → requested', d.status === 200 && d.j.stageStat
 
 d = await D(IDG, { action: 'drive' });
 check('drive 大纲第1批 → draft + 设定', d.status === 200 && d.j.stageStatus === 'draft' && d.j.submission.stages.outline.content.setting === '测试世界观');
+check('记录实际使用的模型名（genModel）', d.j.submission.genModel === 'kimi-k3', 'genModel=' + d.j.submission.genModel);
 check('genBatch 步进到 2', d.j.submission.stages.outline.genBatch.step === 2);
 check('事件流含大纲进度', d.j.submission.events.some((e) => e.type === 'progress' && e.stage === 'outline'));
 

@@ -195,16 +195,21 @@ const CATEGORY_NAMES = {
 };
 const GEN_SYS = '你是北美本土竖屏女频短剧（60-80集）的资深编剧策划，深谙 ReelShort / DramaBox 风格：强钩子、快节奏、高频卡点。输出必须是合法 JSON（无 markdown、无注释、无尾随逗号），英文字段用地道北美口语，中文字段简洁有力。';
 const LOCK_MS = 90 * 1000;
-const SYN_BATCH = 12;   // 梗概每批集数（单批 ≤12s 约束下 ≤600 输出 token）
+const SYN_BATCH = 12;   // 梗概每批集数
 const OUTLINE_STEPS = 3; // 大纲拆 3 批：设定 / 人物 / 五幕
-const FETCH_TIMEOUT_MS = 55 * 1000; // 单次上游调用超时，防边缘函数被平台时长上限掐断（前端会自动重试）
+/* kimi-k3 单批生成实测 20-50s；EdgeOne 边缘函数 fetch 默认超时 15s（必 504），
+   需经 eo.timeoutSetting 显式放宽（平台上限 300s），AbortController 作双保险 */
+const FETCH_TIMEOUT_MS = 110 * 1000;
 
-/* 带超时的 fetch（AbortController 手动实现，兼容各边缘运行时）；超时/网络错误返回 {err} */
+/* 带超时的 fetch（AbortController 手动实现，兼容各边缘运行时）；超时/网络错误返回 {err}。
+   EdgeOne 运行时通过 eo.timeoutSetting 放宽出网超时（默认 15s），本地 Node 忽略该字段 */
 async function fetchT(url, opt, ms) {
   const ctrl = new AbortController();
   const timer = setTimeout(function () { ctrl.abort(); }, ms);
   try {
-    return await fetch(url, Object.assign({}, opt, { signal: ctrl.signal }));
+    const merged = Object.assign({}, opt, { signal: ctrl.signal });
+    merged.eo = { timeoutSetting: { connectTimeout: 15000, readTimeout: ms, writeTimeout: 30000 } };
+    return await fetch(url, merged);
   } catch (e) {
     const name = (e && e.name) || 'network';
     return { err: name === 'AbortError' ? 'FETCH_TIMEOUT（>' + Math.round(ms / 1000) + 's，稍后自动重试）' : 'FETCH_FAIL（' + name + '）' };
@@ -216,7 +221,7 @@ async function fetchT(url, opt, ms) {
 /* Moonshot（OpenAI 兼容）非流式调用，json_object 模式；不传 temperature（k 系列仅允许 1）。
    默认 kimi-k3（纯思考模型，默认 effort=max 太慢）：降 reasoning_effort=low，单批 10-30s；
    思考 token 计入 max_tokens，调用侧已给足余量；content 为干净 JSON */
-async function kimiChat(env, userPrompt, maxTokens) {
+async function kimiChat(env, userPrompt, maxTokens, rec) {
   const key = env.KIMI_API_KEY || '';
   if (!key) return { err: 'KIMI_KEY_UNSET（请在项目环境变量配置 KIMI_API_KEY）' };
   const baseUrl = (env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1').replace(/\/+$/, '');
@@ -254,6 +259,8 @@ async function kimiChat(env, userPrompt, maxTokens) {
   try { data = await res.json(); } catch (_) { return { err: 'KIMI_BAD_RESPONSE' }; }
   const c = data && data.choices && data.choices[0];
   if (!c || !c.message || !c.message.content) return { err: 'KIMI_EMPTY_CONTENT' };
+  /* 记录实际使用的模型（回显上游 data.model），供工作台/接口直接核验 */
+  if (rec) rec.genModel = data.model || model;
   return { text: c.message.content };
 }
 
@@ -324,7 +331,7 @@ async function scPoll(env, taskId) {
   return { pending: true };
 }
 
-/* 下载成品图（带防盗链头）→ {bytes,mime}；KV 单值上限内校验 */
+/* 下载成品图（带防盗链头）→ {bytes,mime}；Pages KV 单值上限 25MB，GPT-Image-2 PNG 实测 1-2MB，留 8MB 余量 */
 async function scDownload(env, url) {
   const res = await fetchT(url, {
     headers: { 'Referer': 'https://api.wuyinkeji.com/', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
@@ -333,7 +340,7 @@ async function scDownload(env, url) {
   if (!res.ok) return { err: 'SC_DL_HTTP_' + res.status };
   const bytes = new Uint8Array(await res.arrayBuffer());
   if (bytes.length < 2048) return { err: 'SC_IMG_TOO_SMALL（' + bytes.length + 'B）' };
-  if (bytes.length > 900 * 1024) return { err: 'SC_IMG_TOO_LARGE（' + Math.round(bytes.length / 1024) + 'KB > 900KB，超 KV 单值上限）' };
+  if (bytes.length > 8 * 1024 * 1024) return { err: 'SC_IMG_TOO_LARGE（' + Math.round(bytes.length / 1024) + 'KB > 8MB）' };
   const isJpg = bytes[0] === 0xff && bytes[1] === 0xd8;
   const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
   if (!isJpg && !isPng) return { err: 'SC_IMG_NOT_IMAGE（非 JPEG/PNG）' };
@@ -364,7 +371,7 @@ async function genOutlineStep(store, rec, env) {
     r = await kimiChat(env, ctx.brief + '\n\n生成本剧大纲的基础设定 JSON（本次只做设定，不含人物与分幕）：\n' +
       '{"logline":"英文一句话 logline","loglineZh":"中文一句话","genreTags":["3个英文题材标签"],"' +
       'setting":"世界观设定120字（时代/地点/规则/氛围）","themes":["3个核心主题词"],"' +
-      'cpDynamics":"主角关系与推拉动力学120字","paywallStrategy":"付费卡点策略100字（卡点密度与钩子类型）"}\n只输出 JSON。', 3500);
+      'cpDynamics":"主角关系与推拉动力学120字","paywallStrategy":"付费卡点策略100字（卡点密度与钩子类型）"}\n只输出 JSON。', 3500, rec);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !parsed.setting) throw new Error('大纲设定批次结构不完整');
@@ -376,7 +383,7 @@ async function genOutlineStep(store, rec, env) {
     r = await kimiChat(env, ctx.brief + '\n已有设定：' + JSON.stringify(entry.content).slice(0, 900) +
       '\n\n基于以上设定生成 6 个主要人物 JSON：\n' +
       '{"mainChars":[{"name":"英文名","role":"身份/立场","want":"核心欲望","flaw":"性格缺陷","arc":"成长弧光"}]}\n' +
-      '恰好 6 人：男女主 + 各 1 个核心对手 + 2 个关键配角。只输出 JSON。', 4000);
+      '恰好 6 人：男女主 + 各 1 个核心对手 + 2 个关键配角。只输出 JSON。', 4000, rec);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !Array.isArray(parsed.mainChars) || parsed.mainChars.length < 4) throw new Error('人物批次结构不完整');
@@ -386,7 +393,7 @@ async function genOutlineStep(store, rec, env) {
   } else {
     r = await kimiChat(env, ctx.brief + '\n已有设定与人物：' + JSON.stringify(entry.content).slice(0, 1600) +
       '\n\n生成五幕主线结构 JSON（恰好 5 幕，eps 覆盖 1 到 ' + total + ' 集且连续不重叠）：\n' +
-      '{"fiveActs":[{"act":"第一幕","title":"幕标题","eps":"1-14","summary":"本幕剧情120字","keyTurns":["转折1","转折2"]}]}\n只输出 JSON。', 4000);
+      '{"fiveActs":[{"act":"第一幕","title":"幕标题","eps":"1-14","summary":"本幕剧情120字","keyTurns":["转折1","转折2"]}]}\n只输出 JSON。', 4000, rec);
     if (r.err) throw new Error(r.err);
     parsed = parseJsonLoose(r.text);
     if (!parsed || !Array.isArray(parsed.fiveActs) || parsed.fiveActs.length < 4) throw new Error('五幕批次结构不完整');
@@ -428,7 +435,7 @@ async function genSynopsisStep(store, rec, env) {
     '\n人物：' + (ctx.chars || '未提供') +
     (prev ? '\n前情（最后2集钩子，需衔接）：\n' + prev : '') +
     '\n\n生成第 ' + from + ' 至 ' + to + ' 集的分集梗概 JSON（恰好 ' + (to - from + 1) + ' 集，ep 连续）：\n' +
-    '{"episodes":[{"ep":' + from + ',"title":"英文短集名","hook":"结尾钩子（本集最后悬念）40字内","beat":"本集剧情节拍70字","paymark":"付费卡点标记，如 第3卡；无卡点则空字符串"}]}\n只输出 JSON。', 6000);
+    '{"episodes":[{"ep":' + from + ',"title":"英文短集名","hook":"结尾钩子（本集最后悬念）40字内","beat":"本集剧情节拍70字","paymark":"付费卡点标记，如 第3卡；无卡点则空字符串"}]}\n只输出 JSON。', 6000, rec);
   if (r.err) throw new Error(r.err);
   const parsed = parseJsonLoose(r.text);
   if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('梗概批次结构不完整');
@@ -481,7 +488,7 @@ async function genScriptStep(store, rec, env) {
     '\n本集梗概：' + need.map(function (e) { return 'EP' + e.ep + '《' + e.title + '》节拍：' + (e.beat || '') + '；结尾钩子：' + (e.hook || ''); }).join('\n') +
     '\n\n撰写第 ' + from + ' 集完整剧本 JSON：\n' +
     '{"episodes":[{"ep":' + from + ',"title":"沿用梗概英文集名","hook":"本集结尾钩子","scenes":[{"no":1,"slug":"INT. 场景名 - 日/夜","action":"场景与动作描述","lines":[{"s":"角色英文名","l":"英文台词（北美口语）","lZh":"中文台词"}]},{"no":2,"slug":"EXT. 场景名 - 日/夜","action":"...","lines":[...]}]}]}\n' +
-    '恰好 2 个场景、每场景 4-5 行对白，只输出 JSON。', 6000);
+    '恰好 2 个场景、每场景 4-5 行对白，只输出 JSON。', 6000, rec);
   if (r.err) throw new Error(r.err);
   const parsed = parseJsonLoose(r.text);
   if (!parsed || !Array.isArray(parsed.episodes) || !parsed.episodes.length) throw new Error('剧本批次结构不完整');
@@ -534,7 +541,7 @@ async function genAssetsStep(store, rec, env) {
     const r = await kimiChat(env, ctx.brief + '\n设定：' + String(ctx.o.setting || '').slice(0, 200) +
       '\n人物：' + (ctx.chars || '') +
       '\n\n为本剧生成 5 张视觉资产的英文生图 prompt JSON（每条 50-80 词，统一 cinematic 短剧海报风格，含主体/构图/光线/情绪，不含文字水印描述）：\n' +
-      '{"key_art":"主视觉海报 prompt（男女主同框张力构图）","char_lead":"主角单人立绘 prompt","char_second":"对手单人立绘 prompt","scene_main":"核心场景概念图 prompt","scene_twist":"高潮剧情概念图 prompt"}\n只输出 JSON。', 3500);
+      '{"key_art":"主视觉海报 prompt（男女主同框张力构图）","char_lead":"主角单人立绘 prompt","char_second":"对手单人立绘 prompt","scene_main":"核心场景概念图 prompt","scene_twist":"高潮剧情概念图 prompt"}\n只输出 JSON。', 3500, rec);
     if (r.err) throw new Error(r.err);
     const prompts = parseJsonLoose(r.text);
     if (prompts) entry.content.prompts = prompts;
