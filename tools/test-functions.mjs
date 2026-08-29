@@ -548,11 +548,14 @@ check('资产阶段仅 prompt 批次调用 Kimi（图片不消耗文本调用）
 d = await D(IDG, { action: 'decision', stage: 'assets', decision: 'approved' });
 check('确认资产 → 发布阶段', d.j.stage === 'publish');
 
+d = await D(IDG, { action: 'drive' });
+check('publish 阶段 drive → idle（前端等待循环优雅停止，不报连接中断）', d.status === 200 && d.j.idle === true && d.j.stage === 'publish');
+
 d = await D(IDG, { action: 'publish-done', feishuDocUrl: 'https://x.feishu.cn/docx/abc', pageUrl: 'https://x/page' });
 check('发布完成 → done', d.j.stage === 'done');
 
 d = await D(IDG, { action: 'drive' });
-check('done 阶段 drive → 400 NOT_GENERATING', d.status === 400 && d.j.error === 'NOT_GENERATING');
+check('done 阶段 drive → idle', d.status === 200 && d.j.idle === true);
 
 const envNoKey = { ...env };
 r = await indexMod.onRequest({ request: post({ ...valid, title: 'No Key Test' }), env: envNoKey, waitUntil });

@@ -608,7 +608,7 @@ async function genAssetsStep(store, rec, env) {
 async function actDrive(store, rec, body, env) {
   const stage = stageOf(rec);
   const genStages = { outline: 1, synopsis: 1, script: 1, assets: 1 };
-  if (!genStages[stage]) return errOut(400, 'NOT_GENERATING', '当前阶段「' + STAGE_LABELS[stage] + '」无需生成驱动');
+  if (!genStages[stage]) return { data: { idle: true, stage: stage, stageStatus: statusOf(rec, stage), submission: rec } };
 
   const now = Date.now();
   if (rec.genLock && now - new Date(rec.genLock).getTime() < LOCK_MS) {

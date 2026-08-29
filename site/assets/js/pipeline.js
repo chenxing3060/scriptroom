@@ -883,8 +883,43 @@
         (c.pageUrl ? '<p><a class="pl-link" target="_blank" rel="noopener" href="' + esc(c.pageUrl) + '">线上剧本详情页 →</a></p>' : '') +
         (c.deployedAt ? '<p class="pl-muted">发布于 ' + esc(fmtTime(c.deployedAt)) + '</p>' : '');
     }
-    return waitHtml('等待发布…',
-      '全部阶段已确认。发布动作：创建飞书文档并归档 → 生成线上详情页并注册剧本库 → 加密上线。完成后此处将显示访问链接。');
+    return '<h3 class="pl-stage-title">🚀 发布上线</h3>' +
+      '<p class="pl-muted">前四个阶段已全部确认。本阶段为人工发布流程，依次完成：</p>' +
+      '<ol class="pl-muted pl-pub-steps">' +
+        '<li>创建飞书在线文档并归档（可编辑 / 导出 Word · PDF）</li>' +
+        '<li>生成线上剧本详情页并注册剧本库（十二段结构 + 密文部署）</li>' +
+        '<li>加密上线，向访问者开放</li>' +
+      '</ol>' +
+      '<div class="pl-pub-form">' +
+        '<p class="pl-muted" style="margin-bottom:6px">完成后粘贴两个链接，标记发布完成：</p>' +
+        '<input class="pl-in" id="pl-pub-feishu" type="url" placeholder="飞书在线文档链接（https://xxx.feishu.cn/docx/…）" autocomplete="off">' +
+        '<input class="pl-in" id="pl-pub-page" type="text" placeholder="线上剧本详情页链接（https://…/script-xxx.html）" autocomplete="off" style="margin-top:10px">' +
+        '<div class="pl-confirm" style="margin-top:16px">' +
+          '<button type="button" class="pl-btn pl-btn-ok" id="pl-publish-done">✓ 标记发布完成</button>' +
+          '<span class="pl-confirm-hint">提交后管线进入「已完成」，此处将显示访问链接</span>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function publishDone() {
+    var feishu = ($('#pl-pub-feishu') || {}).value || '';
+    var page = ($('#pl-pub-page') || {}).value || '';
+    feishu = feishu.trim();
+    page = page.trim();
+    if (!/^https?:\/\//.test(feishu)) { alert('请填写飞书在线文档链接（需以 http(s):// 开头）。'); return; }
+    if (!/^https?:\/\//.test(page) && !/^[\w.-]+\.html(\?.*)?(#.*)?$/.test(page)) {
+      alert('请填写线上剧本详情页链接（完整 URL 或相对路径如 script-xxx.html）。');
+      return;
+    }
+    if (!confirm('确认标记发布完成？该剧本管线将进入「已完成」状态。')) return;
+    var btn = $('#pl-publish-done');
+    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+    api('PATCH', '/api/submissions/' + state.rec.id, { action: 'publish-done', feishuDocUrl: feishu, pageUrl: page })
+      .then(function () { loadDetail(state.rec.id); })
+      .catch(function (ex) {
+        alert('发布失败：' + ex.message);
+        if (btn) { btn.disabled = false; btn.textContent = '✓ 标记发布完成'; }
+      });
   }
 
   /* ---------- 保存与确认 ---------- */
@@ -1064,7 +1099,13 @@
       loadAssetImages();
     }
 
-    if ($('#pl-elapsed')) startGenDrive(stage);
+    if (stage === 'publish') {
+      var pd = $('#pl-publish-done');
+      if (pd) pd.addEventListener('click', publishDone);
+    }
+
+    /* 生成驱动循环仅用于四个生成阶段；发布/完成阶段无 AI 生成，不启动 */
+    if ($('#pl-elapsed') && ['outline', 'synopsis', 'script', 'assets'].indexOf(stage) >= 0) startGenDrive(stage);
   }
 
   /* ---------- init ---------- */
