@@ -707,7 +707,7 @@
       return '<div class="pl-scene">' +
         '<div class="pl-scene-head"><span>场景 ' + (si + 1) + '</span><button type="button" class="pl-mini del-scene">删除场景</button></div>' +
         '<input class="pl-in pl-in-slug" value="' + esc(sc.slug) + '" placeholder="场景标注，如 INT. MANSION - HALL - NIGHT">' +
-        '<textarea class="pl-ta pl-ta-action" rows="2" placeholder="动作 / 导演提示">' + esc(sc.action) + '</textarea>' +
+        '<textarea class="pl-ta pl-ta-action" rows="3" placeholder="动作 / 导演提示">' + esc(sc.action) + '</textarea>' +
         '<div class="pl-lines">' + (lines || '<p class="pl-muted">暂无对白</p>') + '</div>' +
         '<button type="button" class="pl-mini add-line">+ 对白行</button>' +
         '</div>';
@@ -729,7 +729,7 @@
     return '<div class="pl-scene">' +
       '<div class="pl-scene-head"><span>场景</span><button type="button" class="pl-mini del-scene">删除场景</button></div>' +
       '<input class="pl-in pl-in-slug" placeholder="场景标注，如 INT. MANSION - HALL - NIGHT">' +
-      '<textarea class="pl-ta pl-ta-action" rows="2" placeholder="动作 / 导演提示"></textarea>' +
+      '<textarea class="pl-ta pl-ta-action" rows="3" placeholder="动作 / 导演提示"></textarea>' +
       '<div class="pl-lines"></div>' +
       '<button type="button" class="pl-mini add-line">+ 对白行</button>' +
       '</div>';
